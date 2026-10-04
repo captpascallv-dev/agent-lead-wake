@@ -1,0 +1,16 @@
+---
+name: mail-wake
+description: Start, inspect or stop explicitly authorized continuous CLI/Bot delivery reception for registered original Codex Leads.
+---
+
+Codex Mail Wake 0.3.0, MIT. Node22+/Python3.10+. Only registered outbox delivery reception; no personal inbox or provider execution.
+
+1. Before dispatch, configure the bundled ledger route with the actual original Lead ID. Register project/job/attempt and a fresh independent outbox. The executor writes REPORT.md and relative deliverables, then READY.json last (status completed/blocked/failed). Reuse of an outbox by another job/attempt is rejected. A silent exit without READY requires an executor/adapter failed READY or Lead investigation; do not infer task completion from PID.
+2. Only after explicit continuous-reception authorization, call start_app_mailbox_watch for the owned project and inspect app_mailbox_status. The configured coordinator may omit project for all active routes. Do not pass target/root/model/host/command overrides; no private inbox tools exist.
+3. The ordinary program waits continuously without a total deadline. It sends the exact claimed envelope to the registered original owner, preserving the automatic delivery label and original report. Waiting does not require a model turn. Acceptance receipt is transport evidence, not verified Lead continuation or task acceptance.
+4. Actual sending identity comes from this launch environment or this instance's real tool metadata. A persisted permission registrar is not the sending identity. Native refusal is retained; do not invent turn metadata, change models/tiers, delete claims or resend uncertain intents. A new independent attempt needs a fresh outbox.
+5. Status exposes scoped delivery/fault problems. Old malformed history is isolated; exact durable receipts can only finish ack. Transport faults get one short notification to the configured coordinator, with their own one-attempt intent. Normal execution results belong to their original Lead; do not add a reviewer or progress relay.
+6. Stop the owned project with stop_app_mailbox_watch. In all-watch mode this stops only that project; only coordinator may stop all. Preserve ledger/state/receipts/OS lock files. Stop your own watcher/lease to release OS locks; never delete permanent claims to force a retry.
+7. Short bridge failures can recover by rate-limited read-only handshake/actual-actor check on the same launch pipe. New App pipes require a newly launched instance. Do not create an autostart service, restart the shared App, install a provider or modify host approval settings as part of reception.
+
+Use explicit MAIL_WAKE_CONFIG (or explicit MAIL_WAKE_* fields) in the normal MCP launch environment. A GUI/already-running App does not inherit a later shell export; without that environment, place complete user-provided mail-wake.config.json inside the current CODEX_HOME, or the current user's .codex directory. Missing fields/pipe/identity still fail closed. All instances use the same external mailbox/state roots; never store runtime state inside the plugin cache. Configuration, installation, default-ledger commands and READY schema are in the repository codex/README.md. For an installed standalone copy, the ledger CLI is driver/ledger.py.

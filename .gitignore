@@ -1,0 +1,20 @@
+claude/jobs/
+claude/executors.json
+
+# Local configuration and runtime deliveries are never part of a release.
+*.local.json
+.env
+.env.*
+!*.example.json
+codex/mail-wake.config.json
+codex/config.json
+codex/runtime/
+codex/state/
+outboxes/
+test-evidence/
+node_modules/
+__pycache__/
+*.pyc
+*.log
+codex/test-results*.txt
+codex/structure-results.txt

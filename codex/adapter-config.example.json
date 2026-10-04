@@ -1,0 +1,7 @@
+{
+  "mailboxRoot": "./mailbox",
+  "stateDir": "./receiver-state",
+  "coordinatorThreadId": null,
+  "pythonExecutable": "python",
+  "pollIntervalMs": 15000
+}

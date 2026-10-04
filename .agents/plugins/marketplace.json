@@ -1,0 +1,12 @@
+{
+  "name": "agent-lead-wake",
+  "interface": { "displayName": "Agent Lead Wake" },
+  "plugins": [
+    {
+      "name": "codex-mail-wake",
+      "source": { "source": "local", "path": "./codex/plugin" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "codex-mail-wake",
+  "version": "0.3.0",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node server.mjs", "test": "node --test ../tests/public.test.mjs" }
+}
