@@ -205,7 +205,7 @@ test('standard stdio process restart recovers durable exact receipt with ack onl
   assert.throws(() => resolveInstalledOfficialEntry({ cacheRoot: cache, appToolsEntry: path.join(root, 'tests', 'fixtures', 'fake-host.mjs') }), /valid server.mjs/);
   const first = service(f, path.join(root, 'tests', 'fixtures', 'crash-service.mjs')); let second;
   try {
-    assert.equal((await first.call('initialize')).serverInfo.version, '0.3.0');
+    assert.equal((await first.call('initialize')).serverInfo.version, '0.3.1');
     await first.call('tools/call', { name: 'start_app_mailbox_watch', arguments: { project: 'demo' }, _meta: { 'x-codex-turn-metadata': { thread_id: owner } } });
     await until(() => first.child.exitCode === 17); assert.equal(deliveries(f).length, 1); assert.equal(central(f, item.id).state, 'sending');
     second = service(f, path.join(root, 'plugin', 'server.mjs')); await second.call('initialize');
@@ -215,4 +215,41 @@ test('standard stdio process restart recovers durable exact receipt with ack onl
     if (first.child.exitCode === null) { first.child.kill(); await once(first.child, 'close'); }
     if (second) { second.child.stdin.end(); await once(second.child, 'close'); }
   }
+});
+
+test('public prelaunch rejection contract binds identity and paths, delivers once and preserves existing or unknown work', async t => {
+  const f = fixture(t);
+  const prepare = (name, attempt = '1') => {
+    const outbox = path.join(f.base, 'outboxes', `${name}-${attempt}`); fs.mkdirSync(outbox, { recursive: true });
+    const record = cli(f, ['register', '--project', 'demo', '--job', name, '--attempt', attempt, '--outbox', outbox]);
+    fs.writeFileSync(path.join(outbox, 'guard.log'), 'DUMMY_SECRET_NOT_FOR_MESSAGE');
+    const proof = { schema_version: 1, kind: 'prelaunch_rejection', delivery_id: record.key,
+      project: 'demo', job_id: name, attempt_id: attempt, target_thread_id: owner, stage: 'before_executor_spawn',
+      executor_spawn_attempted: false, provider_invocation_attempted: false, execution_started: false,
+      status: 'blocked', reason_code: 'write_scope_rejected', diagnostic_paths: ['guard.log'] };
+    write(path.join(outbox, 'PRELAUNCH_REJECTION.json'), proof);
+    return { id: record.key, outbox, proof };
+  };
+  const good = prepare('prelaunch-good');
+  const wrong = prepare('prelaunch-wrong'); write(path.join(wrong.outbox, 'PRELAUNCH_REJECTION.json'), { ...wrong.proof, target_thread_id: 'not-original-owner' });
+  const escaping = prepare('prelaunch-escape'); write(path.join(escaping.outbox, 'PRELAUNCH_REJECTION.json'), { ...escaping.proof, diagnostic_paths: ['../outside.log'] });
+  const unknown = prepare('prelaunch-unknown'); write(path.join(unknown.outbox, 'PRELAUNCH_REJECTION.json'), { ...unknown.proof, executor_spawn_attempted: true });
+  const existing = prepare('prelaunch-existing'); fs.writeFileSync(path.join(existing.outbox, 'REPORT.md'), 'Original executor report'); write(path.join(existing.outbox, 'READY.json'), { status: 'completed', deliverables: [] });
+  const partial = prepare('prelaunch-partial'); fs.writeFileSync(path.join(partial.outbox, 'REPORT.md'), 'Preserved partial report');
+  const claimed = prepare('prelaunch-claimed'); write(path.join(f.mailboxRoot, 'claims', `${claimed.id}.lock`), { previous: true });
+  const retired = prepare('prelaunch-retired'); const retiredPath = path.join(f.mailboxRoot, 'jobs', `${retired.id}.json`); write(retiredPath, { ...readJson(retiredPath), state: 'retired' });
+  const e = engine(f); e.startWatch(coordinator); await e.tick();
+  assert.equal(central(f, good.id).state, 'sent'); assert.equal(central(f, existing.id).state, 'sent');
+  const report = fs.readFileSync(path.join(good.outbox, 'REPORT.md'), 'utf8');
+  assert.ok(report.includes('not an executor report')); assert.ok(report.includes('guard.log')); assert.equal(report.includes('DUMMY_SECRET'), false);
+  const notification = deliveries(f).find(event => event.params.arguments.prompt.startsWith(`[app-mailbox:${good.id}]`));
+  assert.equal(notification.params.arguments.threadId, owner); assert.ok(notification.params.arguments.prompt.includes('launch-failure receipt'));
+  for (const item of [wrong, escaping, unknown, partial, claimed, retired]) assert.equal(fs.existsSync(path.join(item.outbox, 'READY.json')), false);
+  assert.equal(fs.readFileSync(path.join(partial.outbox, 'REPORT.md'), 'utf8'), 'Preserved partial report');
+  assert.equal(fs.readFileSync(path.join(existing.outbox, 'REPORT.md'), 'utf8'), 'Original executor report');
+  const readyBytes = fs.readFileSync(path.join(good.outbox, 'READY.json')); const sentBytes = fs.readFileSync(path.join(f.mailboxRoot, 'deliveries', `${good.id}.json`));
+  await e.tick(); assert.equal(deliveries(f).length, 2); assert.deepEqual(fs.readFileSync(path.join(good.outbox, 'READY.json')), readyBytes);
+  assert.deepEqual(fs.readFileSync(path.join(f.mailboxRoot, 'deliveries', `${good.id}.json`)), sentBytes);
+  assert.equal(cli(f, ['prelaunch', good.id]).prelaunch_ready_created, false);
+  const newer = prepare('prelaunch-good', '2'); await e.tick(); assert.equal(central(f, newer.id).state, 'sent');
 });

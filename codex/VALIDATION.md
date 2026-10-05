@@ -1,3 +1,20 @@
+# Public Codex 0.3.1 targeted validation
+
+Actual environment: Windows / Node24.19.0 / Python3.12.10. Only the file-only public prelaunch contract changed; earlier 0.3.0 reception evidence below is reused, not recounted as new evidence.
+
+```text
+node --test --test-name-pattern='public prelaunch rejection' codex/tests/public.test.mjs
+node codex/tools/check-public.mjs
+```
+
+The targeted public check passed (1 test, exit0): matching trusted-wrapper metadata becomes one labelled blocked launch-failure notification to the original owner; diagnostic content is not inlined; wrong owner/path/possibly-started declarations do not create READY; existing normal READY, partial report, permanent claim and retired registration are preserved; repeated scan/helper does not change sent/READY, and the same job's new attempt in a fresh outbox receives independently. No provider, actual notification, installation or App operation occurred. Local raw output remains excluded from publication.
+
+This proves the explicit file contract and conversion, not a provider-specific launch adapter or the truth of an arbitrary wrapper assertion. Silent exit/timeout still needs proper executor/adapter terminal evidence or Lead handling. Minimum runtimes, other platforms, real Desktop/official tools and full App lifecycle remain unverified here.
+
+The maintainer separately verified normal Codex CLI marketplace registration, plugin installation reporting version 0.3.1, and MCP discovery in an isolated CODEX_HOME. The active user profile was unchanged. This confirms package registration and discovery, not real Desktop loading or provider execution.
+
+## Preserved 0.3.0 evidence
+
 # Public Codex 0.3.0 validation
 
 Actual local environment: Windows, Node v24.19.0, Python 3.12.10. This record covers only the independent public subtree. No installed production plugin, real mailbox, model/provider, real notification, App lifecycle or automation was operated by these checks.

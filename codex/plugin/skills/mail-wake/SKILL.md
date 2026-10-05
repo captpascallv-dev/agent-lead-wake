@@ -3,7 +3,7 @@ name: mail-wake
 description: Start, inspect or stop explicitly authorized continuous CLI/Bot delivery reception for registered original Codex Leads.
 ---
 
-Codex Mail Wake 0.3.0, MIT. Node22+/Python3.10+. Only registered outbox delivery reception; no personal inbox or provider execution.
+Codex Mail Wake 0.3.1, MIT. Node22+/Python3.10+. Only registered outbox delivery reception; no personal inbox or provider execution.
 
 1. Before dispatch, configure the bundled ledger route with the actual original Lead ID. Register project/job/attempt and a fresh independent outbox. The executor writes REPORT.md and relative deliverables, then READY.json last (status completed/blocked/failed). Reuse of an outbox by another job/attempt is rejected. A silent exit without READY requires an executor/adapter failed READY or Lead investigation; do not infer task completion from PID.
 2. Only after explicit continuous-reception authorization, call start_app_mailbox_watch for the owned project and inspect app_mailbox_status. The configured coordinator may omit project for all active routes. Do not pass target/root/model/host/command overrides; no private inbox tools exist.
@@ -14,3 +14,5 @@ Codex Mail Wake 0.3.0, MIT. Node22+/Python3.10+. Only registered outbox delivery
 7. Short bridge failures can recover by rate-limited read-only handshake/actual-actor check on the same launch pipe. New App pipes require a newly launched instance. Do not create an autostart service, restart the shared App, install a provider or modify host approval settings as part of reception.
 
 Use explicit MAIL_WAKE_CONFIG (or explicit MAIL_WAKE_* fields) in the normal MCP launch environment. A GUI/already-running App does not inherit a later shell export; without that environment, place complete user-provided mail-wake.config.json inside the current CODEX_HOME, or the current user's .codex directory. Missing fields/pipe/identity still fail closed. All instances use the same external mailbox/state roots; never store runtime state inside the plugin cache. Configuration, installation, default-ledger commands and READY schema are in the repository codex/README.md. For an installed standalone copy, the ledger CLI is driver/ledger.py.
+
+0.3.1 accepts a trusted external wrapper's explicit PRELAUNCH_REJECTION.json under the registered outbox. Exact delivery/project/job/attempt/original-owner identity, before_executor_spawn stage, all three invocation/start flags=false and a supported failed/blocked reason are required. The bundled scan/helper converts it to a labelled launch-failure report/READY once. It does not infer prelaunch failure from PID exit, missing request or timeout, does not run a provider, and never overwrites another report/READY/sent/sending/claim. Use a fresh outbox for a new attempt. The complete schema and file-only `mailbox.py prelaunch <id>` command are in codex/README.md.

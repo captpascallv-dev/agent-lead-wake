@@ -175,6 +175,56 @@ def input_file(outbox, relative):
     return content
 
 
+def commit_prelaunch(root, job):
+    """File-only trusted-wrapper assertion; never infer failure from PID/absence."""
+    ident = safe_id(job['key'])
+    box = Path(job['outbox']).resolve(strict=True)
+    if (job.get('state') == 'retired' or (root / 'deliveries' / (ident + '.json')).exists()
+            or (root / 'claims' / (ident + '.lock')).exists() or (box / 'READY.json').exists()):
+        return False
+    candidate = box / 'PRELAUNCH_REJECTION.json'
+    if not candidate.exists():
+        return False
+    proof = json.loads(input_file(box, 'PRELAUNCH_REJECTION.json').decode('utf-8'))
+    allowed = {'schema_version', 'kind', 'delivery_id', 'project', 'job_id', 'attempt_id', 'target_thread_id',
+               'stage', 'executor_spawn_attempted', 'provider_invocation_attempted', 'execution_started',
+               'status', 'reason_code', 'diagnostic_paths'}
+    if not isinstance(proof, dict) or set(proof) - allowed:
+        raise ValueError('Unsupported prelaunch proof fields; no synthetic READY')
+    identity = {'delivery_id': ident, 'project': job['project'], 'job_id': job['job_id'],
+                'attempt_id': job['attempt_id'], 'target_thread_id': job['target_thread_id']}
+    if any(proof.get(field) != value for field, value in identity.items()):
+        raise ValueError('Prelaunch proof differs from immutable registered identity')
+    reasons = {'write_scope_rejected', 'input_validation_rejected', 'dependency_unavailable', 'adapter_preflight_rejected'}
+    if (proof.get('schema_version') != 1 or proof.get('kind') != 'prelaunch_rejection'
+            or proof.get('stage') != 'before_executor_spawn'
+            or any(proof.get(field) is not False for field in ('executor_spawn_attempted', 'provider_invocation_attempted', 'execution_started'))
+            or proof.get('status') not in ('failed', 'blocked') or proof.get('reason_code') not in reasons):
+        raise ValueError('Affirmative before-spawn rejection is required; unknown or possibly-running state is not failure')
+    diagnostics = proof.get('diagnostic_paths', [])
+    if not isinstance(diagnostics, list) or len(diagnostics) > 16:
+        raise ValueError('diagnostic_paths must be at most 16 relative outbox files')
+    for relative in diagnostics:
+        input_file(box, relative)  # Validate scope/existence; do not copy raw content into the report.
+    report = ('# Launch failure receipt (not an executor report or task acceptance)\n\n'
+              f"project: {job['project']}\njob: {job['job_id']}\nattempt: {job['attempt_id']}\n"
+              f"reason_code: {proof['reason_code']}\nstage: before_executor_spawn\n"
+              'The trusted wrapper explicitly rejected before any executor/provider invocation.\n'
+              'No executor result is claimed. Original Lead decides continuation; no retry or acceptance.\n'
+              'Original diagnostic references (under registered outbox):\n' + ''.join(f'- {item}\n' for item in diagnostics))
+    report_bytes = report.encode('utf-8')
+    # A helper-owned partial publication may finish READY after process rebuild;
+    # any different original report wins and is never replaced/relabelled.
+    if (box / 'REPORT.md').exists() and (box / 'REPORT.md').read_bytes() != report_bytes:
+        raise ValueError('Existing REPORT.md is preserved; wrapper must commit its own appropriate READY')
+    if not publish(box / 'REPORT.md', report_bytes, exclusive=True) and (box / 'REPORT.md').read_bytes() != report_bytes:
+        raise ValueError('Another report was published concurrently; no synthetic READY')
+    marker = {'status': proof['status'], 'deliverables': [], 'source': 'prelaunch_rejection',
+              'notes': 'System launch-failure receipt, not executor output or task acceptance'}
+    write(box / 'READY.json', marker, exclusive=True)
+    return True
+
+
 def harvest(root, job):
     ident = safe_id(job["key"])
     filename = root / "deliveries" / (ident + ".json")
@@ -187,7 +237,8 @@ def harvest(root, job):
         raise ValueError("Existing claim without delivery; manual review, never recreate or resend")
     box = Path(job["outbox"]).resolve(strict=True)
     if not (box / "READY.json").exists():
-        return None
+        if not commit_prelaunch(root, job):
+            return None
     marker = json.loads(input_file(box, "READY.json").decode("utf-8"))
     if marker.get("status") not in ("completed", "blocked", "failed"):
         raise ValueError("READY status must be completed, blocked or failed")
@@ -212,9 +263,10 @@ def harvest(root, job):
             report = content.decode("utf-8")
     manifest = {"job": job, "marker": marker, "files": entries}
     write(root / "snapshots" / ident / "manifest.json", manifest, exclusive=True)
+    status_label = 'launch-failure receipt (not executor report)' if marker.get('source') == 'prelaunch_rejection' else 'executor'
     prompt = (f"[app-mailbox:{ident}]\n此消息由收件系统自动投递。\n"
               f"project: {job['project']}\njob: {job['job_id']}\nattempt: {job['attempt_id']}\n"
-              f"executor status: {marker['status']}\nsnapshot: {root / 'snapshots' / ident / 'manifest.json'}\n"
+              f"{status_label} status: {marker['status']}\nsnapshot: {root / 'snapshots' / ident / 'manifest.json'}\n"
               "Transport acceptance is not task acceptance. Read the original report and decide continuation.\n\n" + report)
     delivery = {"id": ident, "project": job["project"], "target_thread_id": job["target_thread_id"],
                 "prompt": prompt, "state": "pending", "created_at": now()}
@@ -230,6 +282,8 @@ def scan(root):
         job = None
         try:
             job = read(filename)
+            if job.get('state') == 'retired':
+                continue
             delivery = harvest(root, job)
             if not delivery or delivery["state"] == "sent":
                 continue
@@ -310,6 +364,8 @@ def main():
         p.add_argument("--" + field, required=True)
     p.add_argument("--source", choices=("cli", "bot"), default="cli")
     sub.add_parser("scan")
+    p = sub.add_parser('prelaunch')
+    p.add_argument('id')
     p = sub.add_parser("claim")
     p.add_argument("id")
     p = sub.add_parser("ack")
@@ -327,6 +383,10 @@ def main():
             return register(root, args.project, args.job, args.attempt, args.outbox, args.source)
         if args.operation == "scan":
             return scan(root)
+        if args.operation == 'prelaunch':
+            ident = safe_id(args.id)
+            committed = commit_prelaunch(root, read(root / 'jobs' / (ident + '.json')))
+            return {'id': ident, 'prelaunch_ready_created': committed, 'acceptance': False, 'automatic_retry': False}
         if args.operation == "claim":
             return claim(root, args.id)
         return ack(root, args.id, read(args.receipt_file))

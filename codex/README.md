@@ -1,4 +1,4 @@
-# Codex Mail Wake 0.3.0
+# Codex Mail Wake 0.3.1
 
 MIT。Node 22+、Python 3.10+。独立的可安装 Codex 插件：普通程序持续接收已登记 CLI/Bot 交付，完整通知发给登记时的原 Lead。没有私信功能、执行器启动、provider 调用或 PID 看门。收到一次交付后继续守候，默认没有总截止；等待本身不调用模型，Lead 处理通知仍会调用模型。
 
@@ -63,7 +63,7 @@ Linux 可把 python 换成 python3。已安装插件内同一 CLI 为 `plugin/dr
 
 status 也可为 blocked/failed，做不完仍交 READY。deliverables 为相对 outbox 的文件路径，使用 `/`；不执行报告或命令，绝对路径、越界路径和逃逸的符号链接拒绝。固定报告为 REPORT.md。单文件上限10MiB、整份快照25MiB、最多64个 deliverables；更大交付需另设计 adapter。单件不可读显示 error，其它登记继续。
 
-默认终态来源**只有 READY**。静默退出需执行器/adapter 交 failed READY，或由 Lead 查执行日志处理；账本不凭 PID 猜业务完成，没有 provider 专用 native recover/receipt collector。CLI/Bot 只是两类登记来源；Bot 使用同一 outbox 协议，在 register 加 `--source bot`。
+常规终态来源仍是READY。0.3.1另支持可信外部wrapper的明确启动前拒绝契约（下节）：文件身份和未尝试调用标志匹配后生成blocked/failed READY。静默退出、超时或可能已调用不适用此转换，仍需执行器/adapter交failed READY或Lead查日志；账本不凭PID猜完成，没有provider专用native recover/receipt collector。CLI/Bot 只是两类登记来源；Bot 使用同一 outbox 协议，在 register 加 `--source bot`。
 
 READY 无内嵌 job/attempt ID，因此规范化 outbox 永久绑定一个 project/job/attempt。相同注册幂等；不同 job/attempt 复用同一 outbox 拒绝，不能把旧 READY 当新轮。首次注册可绑定已有 READY，这是登记者明确确认归属；建议先登记、再启动执行器。新 attempt 必须新 outbox。旧 owner/outbox/source 不可通过重复 register 静默变更；route 换 owner 必须显式 `--replace-owner`，旧登记仍保留原 owner，需明确交接。project/job/attempt 为1..40个安全 ASCII 字符，允许字母、数字、`_`、`-`、`.`，必须以字母或数字开头。
 
@@ -106,3 +106,36 @@ npm --prefix codex/plugin test
 ```
 
 或 `node --test codex/tests/public.test.mjs`。测试从 PATH 找 Python3.10+；可用 `MAIL_WAKE_TEST_PYTHON` 指定测试解释器。只用新建 OS 临时目录、默认公共账本与假 MCP cache/host，清理前验证目录范围。实际公共检查见 [VALIDATION.md](VALIDATION.md)，不沿用其它版本统计。
+
+## 0.3.1：明确启动前拒绝的可用文件契约
+
+付费执行仍由外部wrapper负责，MCP不启动provider。只有wrapper确认在任何executor spawn/provider invocation尝试之前拒绝，才在已登记outbox原子写PRELAUNCH_REJECTION.json；注册输出的key就是下面delivery_id。身份必须全部匹配原登记，不能用它换owner或job/attempt。
+
+```json
+{
+  "schema_version": 1,
+  "kind": "prelaunch_rejection",
+  "delivery_id": "YOUR_REGISTERED_DELIVERY_KEY",
+  "project": "demo",
+  "job_id": "example",
+  "attempt_id": "1",
+  "target_thread_id": "YOUR_ORIGINAL_LEAD_THREAD_ID",
+  "stage": "before_executor_spawn",
+  "executor_spawn_attempted": false,
+  "provider_invocation_attempted": false,
+  "execution_started": false,
+  "status": "blocked",
+  "reason_code": "write_scope_rejected",
+  "diagnostic_paths": ["launch-check.log"]
+}
+```
+
+status仅failed/blocked；reason_code仅write_scope_rejected/input_validation_rejected/dependency_unavailable/adapter_preflight_rejected。诊断引用必须是存在的相对outbox文件，最多16项；不执行或内联内容，不写stderr/密钥/模型响应到证明字段。其他字段、错误身份或未知/可能已启动的标志拒收，不生成failed/completed。此协议相信被授权wrapper的明确陈述，不是PID检测，也不是MCP替wrapper证明付费调用。
+
+默认scan自动处理；也可显式调用文件-only helper：
+
+```text
+python codex/tools/mailbox.py --root ../wake-demo/mailbox prelaunch YOUR_REGISTERED_DELIVERY_KEY
+```
+
+helper生成明确非执行者报告/非验收的REPORT.md和READY，然后沿原scan/claim/ack只通知原owner一次。已有READY/delivery/永久claim/retired优先；不同的既有REPORT.md不覆盖，同内容的helper半成品可完成READY。正常READY保持原样。旧sending/sent/intent不重放；新attempt必须新outbox。静默退出不能把这个文件当作缺request/超时的猜测性失败模板。
