@@ -25,9 +25,12 @@ const owner = 'test-lead', coordinator = 'test-coordinator', actor = 'test-actor
 const write = (filename, value) => { fs.mkdirSync(path.dirname(filename), { recursive: true }); fs.writeFileSync(filename, JSON.stringify(value)); };
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check) { for (let count = 0; count < 250; count++) { if (check()) return; await pause(20); } throw new Error('Timed out waiting for test state'); }
-function cli(f, args, success = true) {
-  const result = spawnSync(python, ['-B', '-X', 'utf8', ledger, '--root', f.mailboxRoot, ...args], { encoding: 'utf8', windowsHide: true, shell: false });
-  if (success) assert.equal(result.status, 0, result.stdout); else assert.equal(result.status, 1);
+function cli(f, args, success = true, cwd) {
+  const options = { encoding: 'utf8', windowsHide: true, shell: false };
+  if (cwd) options.cwd = cwd;
+  const result = spawnSync(python, ['-B', '-X', 'utf8', ledger, '--root', f.mailboxRoot, ...args], options);
+  const detail = `${result.stdout}\n${result.stderr}`;
+  if (success) assert.equal(result.status, 0, detail); else assert.equal(result.status, 1, detail);
   return JSON.parse(result.stdout);
 }
 function fixture(t) {
@@ -205,7 +208,7 @@ test('standard stdio process restart recovers durable exact receipt with ack onl
   assert.throws(() => resolveInstalledOfficialEntry({ cacheRoot: cache, appToolsEntry: path.join(root, 'tests', 'fixtures', 'fake-host.mjs') }), /valid server.mjs/);
   const first = service(f, path.join(root, 'tests', 'fixtures', 'crash-service.mjs')); let second;
   try {
-    assert.equal((await first.call('initialize')).serverInfo.version, '0.3.1');
+    assert.equal((await first.call('initialize')).serverInfo.version, '0.3.2');
     await first.call('tools/call', { name: 'start_app_mailbox_watch', arguments: { project: 'demo' }, _meta: { 'x-codex-turn-metadata': { thread_id: owner } } });
     await until(() => first.child.exitCode === 17); assert.equal(deliveries(f).length, 1); assert.equal(central(f, item.id).state, 'sending');
     second = service(f, path.join(root, 'plugin', 'server.mjs')); await second.call('initialize');
@@ -252,4 +255,114 @@ test('public prelaunch rejection contract binds identity and paths, delivers onc
   assert.deepEqual(fs.readFileSync(path.join(f.mailboxRoot, 'deliveries', `${good.id}.json`)), sentBytes);
   assert.equal(cli(f, ['prelaunch', good.id]).prelaunch_ready_created, false);
   const newer = prepare('prelaunch-good', '2'); await e.tick(); assert.equal(central(f, newer.id).state, 'sent');
+});
+
+test('legal relative attachments snapshot the registered outbox from an independent cwd', async t => {
+  const f = fixture(t);
+  const cwdBefore = process.cwd();
+  const decoy = path.join(f.base, 'decoy-cwd');
+  const nested = 'nested/子 目录/note file.txt';
+  const spaced = 'spaced name.txt';
+  fs.mkdirSync(path.join(decoy, 'nested', '子 目录'), { recursive: true });
+  fs.writeFileSync(path.join(decoy, 'nested', '子 目录', 'note file.txt'), 'DECOY-NESTED');
+  fs.writeFileSync(path.join(decoy, spaced), 'DECOY-SPACE');
+  const register = jobId => {
+    const outbox = path.join(f.base, 'outboxes', jobId);
+    fs.mkdirSync(outbox, { recursive: true });
+    const registration = cli(f, ['register', '--project', 'demo', '--job', jobId, '--attempt', '1', '--outbox', outbox]);
+    return { id: registration.key, outbox, jobId };
+  };
+  const good = register('relative-good');
+  const nestedBytes = Buffer.from('OUTBOX-NESTED-中文');
+  const spacedBytes = Buffer.from('OUTBOX-SPACED');
+  fs.mkdirSync(path.join(good.outbox, 'nested', '子 目录'), { recursive: true });
+  fs.writeFileSync(path.join(good.outbox, 'nested', '子 目录', 'note file.txt'), nestedBytes);
+  fs.writeFileSync(path.join(good.outbox, spaced), spacedBytes);
+  fs.writeFileSync(path.join(good.outbox, 'REPORT.md'), 'Original relative report\n');
+  write(path.join(good.outbox, 'READY.json'), { status: 'completed', deliverables: [nested, spaced] });
+  const scan = cli(f, ['scan'], true, decoy);
+  assert.equal(scan.ready.length, 1); assert.equal(scan.ready[0].id, good.id); assert.equal(scan.errors.length, 0);
+  const snap = relative => fs.readFileSync(path.join(f.mailboxRoot, 'snapshots', good.id, ...relative.split('/')));
+  assert.deepEqual(snap(nested), nestedBytes); assert.deepEqual(snap(spaced), spacedBytes);
+  assert.equal(snap('REPORT.md').toString('utf8'), 'Original relative report\n');
+  const claimed = cli(f, ['claim', good.id], true, decoy);
+  assert.equal(claimed.target_thread_id, owner); assert.equal(claimed.state, 'sending');
+  const receipt = path.join(f.base, 'relative-receipt.json');
+  write(receipt, { structuredContent: { threadId: owner }, isError: false });
+  assert.equal(cli(f, ['ack', good.id, receipt], true, decoy).state, 'sent');
+  const sentDelivery = fs.readFileSync(path.join(f.mailboxRoot, 'deliveries', `${good.id}.json`));
+  const sentSnapshot = fs.readFileSync(path.join(f.mailboxRoot, 'snapshots', good.id, 'REPORT.md'));
+  const preserve = (jobId, state) => {
+    const item = register(jobId);
+    const filename = path.join(f.mailboxRoot, 'deliveries', `${item.id}.json`);
+    const body = `{"id":"${item.id}","project":"demo","target_thread_id":"${owner}","prompt":"kept-${state}","state":"${state}"}`;
+    fs.writeFileSync(filename, body);
+    fs.writeFileSync(path.join(item.outbox, 'REPORT.md'), `rewrite-${state}`);
+    write(path.join(item.outbox, 'READY.json'), { status: 'completed', deliverables: [spaced] });
+    fs.writeFileSync(path.join(item.outbox, spaced), `new-${state}`);
+    return { ...item, filename, body };
+  };
+  const keptSent = preserve('kept-sent', 'sent');
+  const keptSending = preserve('kept-sending', 'sending');
+  const planted = path.join(f.mailboxRoot, 'snapshots', keptSent.id, 'REPORT.md');
+  fs.mkdirSync(path.dirname(planted), { recursive: true });
+  fs.writeFileSync(planted, 'ORIGINAL-SNAPSHOT');
+  const reject = (jobId, deliverable, plant) => {
+    const item = register(jobId);
+    fs.writeFileSync(path.join(item.outbox, 'REPORT.md'), `report-${jobId}`);
+    if (plant) plant(item.outbox);
+    write(path.join(item.outbox, 'READY.json'), { status: 'completed', deliverables: [deliverable] });
+    return item;
+  };
+  fs.writeFileSync(path.join(f.base, 'outside.txt'), 'OUTSIDE');
+  const parent = reject('escape-parent', '../outside.txt');
+  const absolutePath = path.join(f.base, 'absolute-outside.txt');
+  fs.writeFileSync(absolutePath, 'ABSOLUTE-OUTSIDE');
+  const absolute = reject('escape-absolute', absolutePath);
+  const directory = reject('escape-directory', 'only-dir', box => fs.mkdirSync(path.join(box, 'only-dir')));
+  const rejected = [parent, absolute, directory];
+  if (process.platform === 'win32') {
+    const drive = path.parse(good.outbox).root.replace(/[\\/]+$/, '');
+    assert.match(drive, /^[A-Za-z]:$/);
+    rejected.push(reject('win-drive-file', `${drive}alias-name.txt`, box => fs.writeFileSync(path.join(box, 'alias-name.txt'), 'INSIDE-ALIAS')));
+    rejected.push(reject('win-drive-nested', `${drive}sub/file.txt`, box => {
+      fs.mkdirSync(path.join(box, 'sub')); fs.writeFileSync(path.join(box, 'sub', 'file.txt'), 'INSIDE-SUB');
+    }));
+    rejected.push(reject('win-root-relative', '/alias-name.txt'));
+  }
+  const again = cli(f, ['scan'], true, decoy);
+  const errors = new Map(again.errors.map(item => [item.id, item.error]));
+  const walk = directory => {
+    const chunks = [];
+    if (!fs.existsSync(directory)) return chunks;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const full = path.join(directory, entry.name);
+      if (entry.isDirectory()) chunks.push(...walk(full)); else chunks.push(fs.readFileSync(full));
+    }
+    return chunks;
+  };
+  for (const item of rejected) {
+    assert.equal(errors.has(item.id), true, item.jobId); assert.equal(central(f, item.id), null);
+    const joined = Buffer.concat(walk(path.join(f.mailboxRoot, 'snapshots', item.id)));
+    for (const marker of ['INSIDE-ALIAS', 'INSIDE-SUB', 'DECOY-', 'OUTSIDE', 'ABSOLUTE-OUTSIDE']) {
+      assert.equal(joined.includes(Buffer.from(marker)), false, item.jobId);
+    }
+  }
+  assert.match(errors.get(parent.id), /escape or alias/);
+  assert.match(errors.get(absolute.id), /relative forward-slash paths/);
+  assert.match(errors.get(directory.id), /not a regular file/);
+  if (process.platform === 'win32') {
+    for (const item of rejected.filter(entry => entry.jobId.startsWith('win-'))) assert.match(errors.get(item.id), /relative forward-slash paths/);
+  }
+  assert.equal(fs.readFileSync(keptSent.filename, 'utf8'), keptSent.body);
+  assert.equal(fs.readFileSync(keptSending.filename, 'utf8'), keptSending.body);
+  assert.equal(fs.readFileSync(planted, 'utf8'), 'ORIGINAL-SNAPSHOT');
+  assert.equal(fs.existsSync(path.join(f.mailboxRoot, 'snapshots', keptSending.id)), false);
+  assert.deepEqual(fs.readFileSync(path.join(f.mailboxRoot, 'deliveries', `${good.id}.json`)), sentDelivery);
+  assert.deepEqual(fs.readFileSync(path.join(f.mailboxRoot, 'snapshots', good.id, 'REPORT.md')), sentSnapshot);
+  assert.deepEqual(snap(nested), nestedBytes); assert.deepEqual(snap(spaced), spacedBytes);
+  assert.equal(again.ready.some(item => item.id === good.id), false);
+  assert.equal(again.uncertain.some(item => item.id === keptSending.id), true);
+  assert.equal(again.ready.concat(again.uncertain).some(item => item.id === keptSent.id), false);
+  assert.equal(process.cwd(), cwdBefore);
 });

@@ -159,6 +159,12 @@ def register(root, project, job_id, attempt_id, outbox, source="cli"):
 def input_file(outbox, relative):
     if not isinstance(relative, str) or not relative or Path(relative).is_absolute() or "\\" in relative:
         raise ValueError("deliverables must use relative forward-slash paths under outbox")
+    # Drive-relative (C:name) and root-relative (/name) are not Path.is_absolute() on Windows.
+    # Joining them aliases into the outbox or re-roots on the current drive. POSIX C:name stays a filename.
+    if os.name == "nt":
+        drive, tail = os.path.splitdrive(relative)
+        if drive or tail.startswith("/") or tail.startswith("\\"):
+            raise ValueError("deliverables must use relative forward-slash paths under outbox")
     lexical = Path(relative)
     if any(part in ("..", ".") for part in lexical.parts):
         raise ValueError("Input path cannot escape or alias outbox")

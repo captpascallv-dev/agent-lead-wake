@@ -1,3 +1,22 @@
+# Public Codex 0.3.2 validation
+
+Actual environment: Windows / Node v24.19.0 / Python 3.12.10. Legal relative deliverables were already resolved from the registered outbox. This version rejects ambiguous Windows drive-relative and root-relative anchors before join, and adds one real CLI consumer regression. The 0.3.1 and 0.3.0 sections below stay as earlier evidence. They are not recounted as this run. Private adapter trials are separate and are not included here.
+
+From the repository root:
+
+```text
+node --test codex/tests/public.test.mjs
+node codex/tools/check-public.mjs
+```
+
+The public suite completed with **8 passed, 0 failed**, exit 0. The structure check then passed, exit 0: version 0.3.2, 11 Node syntax checks, 3 Python AST checks, three reception tools, explicit configuration, bundled runtime dependencies, and no literal machine user paths or session IDs. The new test launched the ledger CLI with an independent spawn working directory. Nested, non-ASCII, and spaced relative attachments were snapshotted from the registered outbox rather than a same-named file in that working directory. On this Windows run, same-drive drive-relative paths (`C:name`, `C:sub/file` using the fixture volume letter) and a forward-slash root-relative path were rejected and were not read as attachments. Parent paths, absolute paths, and directory deliverables were still rejected. A normal delivery was claimed and acknowledged to the original fixture owner. Existing sent and sending records, including an existing snapshot, were left byte-for-byte unchanged. The process-global working directory was not changed.
+
+No provider, real notification, installation, App operation, or publication was part of this check. Local raw output stays outside this tree. Ubuntu, macOS, and other Windows layouts were not executed, so those platforms remain unverified. Passing this Windows fixture run does not prove marketplace install or Desktop loading.
+
+The maintainer separately verified normal Codex CLI marketplace registration, installation reporting version 0.3.2, and MCP discovery in an isolated CODEX_HOME. The active user profile was unchanged. This confirms package registration and discovery, not real Desktop loading or provider execution.
+
+## Preserved 0.3.1 evidence
+
 # Public Codex 0.3.1 targeted validation
 
 Actual environment: Windows / Node24.19.0 / Python3.12.10. Only the file-only public prelaunch contract changed; earlier 0.3.0 reception evidence below is reused, not recounted as new evidence.

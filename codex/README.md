@@ -1,4 +1,4 @@
-# Codex Mail Wake 0.3.1
+# Codex Mail Wake 0.3.2
 
 MIT。Node 22+、Python 3.10+。独立的可安装 Codex 插件：普通程序持续接收已登记 CLI/Bot 交付，完整通知发给登记时的原 Lead。没有私信功能、执行器启动、provider 调用或 PID 看门。收到一次交付后继续守候，默认没有总截止；等待本身不调用模型，Lead 处理通知仍会调用模型。
 
@@ -61,7 +61,7 @@ Linux 可把 python 换成 python3。已安装插件内同一 CLI 为 `plugin/dr
 {"status":"completed","deliverables":["result.txt"],"notes":"One sentence"}
 ```
 
-status 也可为 blocked/failed，做不完仍交 READY。deliverables 为相对 outbox 的文件路径，使用 `/`；不执行报告或命令，绝对路径、越界路径和逃逸的符号链接拒绝。固定报告为 REPORT.md。单文件上限10MiB、整份快照25MiB、最多64个 deliverables；更大交付需另设计 adapter。单件不可读显示 error，其它登记继续。
+status 也可为 blocked/failed，做不完仍交 READY。deliverables 为相对 outbox 的文件路径，使用 `/`。合法相对路径按登记 outbox 解析，调用者的当前目录不参与定位；嵌套、空格和非 ASCII 文件名沿用这一契约。不执行报告或命令。绝对路径、反斜杠、越界路径和逃逸的符号链接拒绝。Windows 上盘符相对（`C:name`、`C:sub/file`）和无盘符根相对（`/name`）在拼接前拒绝，避免被当成登记目录内的别名或当前盘根上的文件。POSIX 上 `C:name` 仍是合法相对文件名。固定报告为 REPORT.md。单文件上限10MiB、整份快照25MiB、最多64个 deliverables；更大交付需另设计 adapter。单件不可读显示 error，其它登记继续。
 
 常规终态来源仍是READY。0.3.1另支持可信外部wrapper的明确启动前拒绝契约（下节）：文件身份和未尝试调用标志匹配后生成blocked/failed READY。静默退出、超时或可能已调用不适用此转换，仍需执行器/adapter交failed READY或Lead查日志；账本不凭PID猜完成，没有provider专用native recover/receipt collector。CLI/Bot 只是两类登记来源；Bot 使用同一 outbox 协议，在 register 加 `--source bot`。
 
@@ -139,3 +139,9 @@ python codex/tools/mailbox.py --root ../wake-demo/mailbox prelaunch YOUR_REGISTE
 ```
 
 helper生成明确非执行者报告/非验收的REPORT.md和READY，然后沿原scan/claim/ack只通知原owner一次。已有READY/delivery/永久claim/retired优先；不同的既有REPORT.md不覆盖，同内容的helper半成品可完成READY。正常READY保持原样。旧sending/sent/intent不重放；新attempt必须新outbox。静默退出不能把这个文件当作缺request/超时的猜测性失败模板。
+
+## 0.3.2：拒绝 Windows 歧义锚点
+
+公共账本读取附件时，合法相对路径本来就锚定登记 outbox：`(outbox / lexical).resolve(strict=True)`。本次不把契约放宽成绝对路径，也不改快照或通知。补上的是拼接前的 Windows fail-closed：路径带盘符，或去掉盘符后的尾部以 `/` 开头时，直接拒绝。同盘 `C:name` 与 `C:sub/file` 否则会拼成登记目录里的别名；`/name` 否则会重新定到当前盘根。反斜杠路径仍由原规则拒绝。
+
+消费者回归从独立工作目录运行真实 CLI。嵌套、中文和空格相对附件的快照是 outbox 字节。`../`、绝对路径和目录仍然拒绝，正常交付仍交给原 fixture owner，已有 sent/sending 不重写。Windows 专有断言只在实际运行的平台执行。本机私有适配的试运行记录不在本包；公共离线检查见 [VALIDATION.md](VALIDATION.md)。
