@@ -1,4 +1,4 @@
-# Codex Mail Wake 0.3.2
+# Codex Mail Wake 0.4.0
 
 MIT。Node 22+、Python 3.10+。独立的可安装 Codex 插件：普通程序持续接收已登记 CLI/Bot 交付，完整通知发给登记时的原 Lead。没有私信功能、执行器启动、provider 调用或 PID 看门。收到一次交付后继续守候，默认没有总截止；等待本身不调用模型，Lead 处理通知仍会调用模型。
 
@@ -40,7 +40,7 @@ Bash：
 export MAIL_WAKE_CONFIG="$(realpath ../wake-demo/config.json)"
 ```
 
-`.mcp.json` 使用插件根 `cwd: "."`、`node ./server.mjs`，继承配置与本次宿主 `CODEX_APP_TOOLS_PIPE_PATH`、`CODEX_THREAD_ID` 和当前账号运行时环境。不要把 pipe 写进配置或持久状态；没有 pipe/真实身份的实例不 scan。没有机器绑定的 stateDir 或 target/model/host 覆盖参数。
+`.mcp.json` 使用插件根 `cwd: "."`、`node ./server.mjs`，继承配置与本次宿主 `CODEX_APP_TOOLS_PIPE_PATH`、`CODEX_THREAD_ID` 和当前账号运行时环境。不要把 pipe 写进配置或持久状态；缺 pipe，或既无真实 actor 又无有效后台委托的实例不 scan。没有机器绑定的 stateDir 或 target/model/host 覆盖参数。
 
 普通 stdio 入口也可用：`node codex/plugin/server.mjs --config /your/config.json`。普通终端没有宿主 pipe 时只保留状态，不伪造宿主发送。
 
@@ -76,28 +76,51 @@ READY 无内嵌 job/attempt ID，因此规范化 outbox 永久绑定一个 proje
 | `start_app_mailbox_watch({"project":"demo"})` | 实际 caller 是该项目当前原 owner；持久持续接收许可 |
 | `app_mailbox_status({"project":"demo"})` | 普通 Lead只见自己当前登记项目及运输状态 |
 | `stop_app_mailbox_watch({"project":"demo"})` | 停本项目，保留所有 pending/claim/intent/receipt |
+| `grant_app_mailbox_delegation({})` | 仅本次真实 caller 为配置协调者；明确授予可撤销后台身份委托，不开启 watch |
+| `revoke_app_mailbox_delegation({})` | 仅本次真实 caller 为配置协调者；撤回后台委托，保留交付与收据 |
 
 配置协调者可省略 project 启用/停止全体 active routes；普通 Lead不能这么做。全体模式下项目 stop 是持久 opt-out。已启用的全体 start 幂等，不覆盖 opt-out；协调者 stop 后再 start 才是新轮许可。
 
-权限按真实 tools/call metadata（无 metadata 时真实 executor env）检查。后台 actor 优先取本次 `CODEX_THREAD_ID`，缺失才由本实例真实工具 metadata 绑定；它可不同于 target/许可注册者，但绝不把持久 registrar 冒充发送者。没有伪造 turn_id、改变原模型/档位/服务档。start/stop 遵循正常 prompt 审批；官方审批配置未改，原生拒绝不换路处理。
+权限按真实 tools/call metadata（无 metadata 时真实 executor env）检查。后台 actor 优先取本次 `CODEX_THREAD_ID`，缺失才由本实例真实工具 metadata 绑定；仅这两者均缺失时，有效明确委托可提供后台 actor。持久 registrar 不构成委托，委托永不充当普通工具 caller。没有伪造 turn_id、改变原模型/档位/服务档。start/stop/grant/revoke 遵循正常 prompt 审批；官方审批配置未改，原生拒绝不换路处理。
 
 `scan -> 原子 claim -> 官方 send -> exact receipt ack`。claim.prompt 原样发送，包括自动投递说明和原报告。读取原 owner，只有 idle/notLoaded 可送；active/systemError/未知保持 pending。[官方 ThreadStatus 类型](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/ThreadStatus.ts)与[thread/read 文档](https://learn.chatgpt.com/docs/app-server#read-a-stored-thread-without-resuming)是接口依据，read 不会加载线程。sent 仅证明通知接受，Lead实际接续/任务验收另行确认。
 
+## 后台身份委托（0.4.0）
+
+只有配置的 `coordinatorThreadId` 可操作；工具不接受任何参数，包括 caller/actor/target/pipe/root/model/project。普通 Lead 仍按项目启停，不能授予委托。首次使用由协调者明确调用：
+
+```text
+start_app_mailbox_watch({})
+grant_app_mailbox_delegation({})
+```
+
+grant 要求已启用且 epoch 有效的协调者 all-watch，将 coordinator、当前接收 state 根、mailbox 根和 epoch 写入 `stateDir/app-mailbox/delegation.json`，并保留 delegation-history。重复同范围有效 grant 幂等。grant/revoke 用独立短 OS 控制锁串行；争用时工具明确返回 busy，不改权限，可重新明确调用。记录不是防本机写权限持有者篡改的签名凭证；账本和接收状态目录须由用户保护。
+
+新服务只要被正常宿主加载、收到本次 launch pipe 且 grant 当前仍有效，就可在没有 `CODEX_THREAD_ID`、tools/call 或 hook 的情况下后台接收。actorSource 为 `persisted_delegation`；leader、intent 和状态包含 grant ID。出现本次真实 actor 后它优先，status 分开展示 actualActor 与后台 actor。持久委托不会补齐缺身份的工具调用，也不授予别的账号、业务项目或发送目标。
+
+```text
+revoke_app_mailbox_delegation({})
+```
+
+revoke 后只停止依赖该委托的新后台动作；具有独立真实 actor 且仍有 watch 许可的实例沿原权限继续。如需停止全部收件，由协调者调用 `stop_app_mailbox_watch({})`。停止全体或 epoch 改变会使旧 grant 失效；之后 start/status/重建均不能复活旧 grant，必须重新明确 grant。项目 opt-out、held、closed 一直有效。
+
+无 grant、坏记录、错 coordinator/根/epoch 或缺 launch pipe 均拒绝委托恢复。坏委托需协调者明确 revoke 后才能新 grant。在领取、intent/send 前和 OS lease、scan、read/claim、桥 handshake 等关键 await 后复核 actor、epoch 和项目许可。已经提交的 send 保留真实 receipt 并沿原规则 ack；旧 sending/uncertain/manual_review_required 不自动重发。委托文件不保存 pipe；每个新进程只使用本次宿主环境提供的 pipe。
+
 ## 持续、恢复和故障
 
-`.codex-mail-wake.leader.lock` 由 Python lease 持有非阻塞 OS 锁，父 stdin EOF/进程退出由 OS 释放；其它实例每分钟尝试接替。每次 scan/claim/ack（包括默认 CLI）还共用 `.codex-mail-wake.driver.lock` 短锁。永久 claims/<id>.lock 是交付独占权，不能删来重试；claim 输家直接返回，不写胜方 outcome。
+`.codex-mail-wake.leader.lock` 由 Python lease 持有非阻塞 OS 锁，父 stdin EOF/进程退出由 OS 释放；其它实例每分钟尝试接替。每次 scan/claim/ack（包括默认 CLI）还共用 `.codex-mail-wake.driver.lock` 短锁；grant/revoke 共用 `.codex-mail-wake.authorization.lock` 短锁。永久 claims/<id>.lock 是交付独占权，不能删来重试；claim 输家直接返回，不写胜方 outcome。
 
 intent 在 send 前完整 fsync、独占原子发布。超时/退出/拒绝/错目标保留 sending/claim 与局部 uncertain，不盲重发；精确持久收据可重建后仅补 ack。旧终态历史目录不反复读中央；历史中央缺失/损坏/身份不符逐件标异常，其它件继续。快照和不可变 JSON 先完整写临时文件，再 exclusive hard-link 发布；需要支持本地 hard links/atomic rename 的文件系统，不建议网络共享。
 
 同一 attempt 即使 READY 后续变化或同源重复观察，sent/claim/intent 不重放；新 attempt/新 outbox 才有新交付。project 名称大小写敏感；状态文件用小写字节编码，Demo/demo 在 Windows 也互不启停。默认账本注册时一次性生成紧凑小写交付ID，并核对完整既有登记，不会采用另一个键的记录。超长 adapter ID 的文件名使用缓存的紧凑身份键以守住长度边界；这些摘要的消费者是文件身份/既有登记比对，不是报告/日志。快照只在首次交卷保存并比较已有副本，不在每轮计算内容摘要。
 
-桥子进程失效后释放领班，同实例至少等60秒，再每分钟至多一次用**原 launch pipe** handshake＋read 真实 actor 身份；成功才重新竞争领班。拒绝/错误身份不scan、不send。App 换 pipe 需新启动环境实例接替，不扫描内存/凭据、不猜或持久化 raw pipe。
+桥子进程失效后释放领班，同实例至少等60秒，再每分钟至多一次用**原 launch pipe** handshake＋read 当前授权 actor（真实身份或有效委托）；成功且授权仍有效才重新竞争领班。该只读检查不构成 grant 或普通 caller 身份证明。拒绝/错误身份不scan、不send。App 换 pipe 需新启动环境实例接替，不扫描内存/凭据、不猜或持久化 raw pipe。
 
 限定故障向配置协调者单次通知：uncertain/manual review、同登记 collector error 连续3轮、同 pending 因 owner 状态阻塞2小时。短通知仅含ID/project/原因/状态路径；故障本身也有独占 intent/receipt/outcome，拒绝或未知不重试。不发正常进度/成功/空目录/held通知。故障发布失败写 record-problems，status可见，不让坏件堵整条线。
 
-保留账本、两种 OS 锁文件、接收许可、intent/receipt/outcome、faults、record-problems及快照。停止自己的 watcher/lease 让 OS 解锁，不删 claim/intent。更新插件不要删用户状态根。所有实例同一配置；状态已绑定其它账本时拒绝复用。
+保留账本、OS 锁文件、接收许可、委托及历史、intent/receipt/outcome、faults、record-problems及快照。停止自己的 watcher/lease 让 OS 解锁，不删 claim/intent。更新插件不要删用户状态根。所有实例同一配置；状态已绑定其它账本时拒绝复用。
 
-服务遵循 MCP stdio 生命周期。服务**被重新加载时可恢复**，不等于 App 启动就会加载；没有系统服务、计划任务或自动重启 provider/App。完整 App 更新/关闭再打开、新pipe、真实未加载线程及实际 Lead接续未在公共包现场验证。
+服务遵循 MCP stdio 生命周期。服务**被重新加载且授权/pipe有效时可恢复**，不等于 App 启动就会加载；没有系统服务、计划任务或自动重启 provider/App。公共0.4.0的服务重建只以 stdio 与假官方宿主验证。完整 App 更新/关闭再打开、新真实交付、真实未加载线程及实际 Lead接续未在公共包现场验证；其它私有部署的局部恢复或只读桥证据不替代这项验收。
 
 ## 公共包检查
 

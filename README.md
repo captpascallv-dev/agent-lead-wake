@@ -103,6 +103,8 @@ pwsh -NoProfile -File claude/bin/Dispatch.ps1 -Executor codex `
 3. 原 Lead 明确调用 `start_app_mailbox_watch` 开始收件，派发自己的外部任务。
 4. 交付到达后，程序原文投给 exact owner；Lead 读产物、验收或退修。模型与档位不被运输层覆盖。
 
+0.4.0 增加可撤销的后台身份委托：配置协调者先明确启用全体接收，再按正常审批调用 `grant_app_mailbox_delegation({})`。新服务被宿主加载时，即使没有启动 actor 或任何工具调用，也可凭当前有效 grant 与本次 launch pipe 恢复接收；状态如实标注 `persisted_delegation`。grant 绑定配置协调者、两个状态根和当前 all-watch epoch，不开启接收权限，也不代替普通工具 caller。`revoke_app_mailbox_delegation({})` 撤回后台委托；停止全体接收或改变 epoch 后必须重新明确 grant。见 [委托契约](codex/README.md#后台身份委托040)。
+
 公开包自带最小交付账本，不需要作者的私有 `mailbox.py`、业务 collector、账号或本机目录。两个私人主对话之间的信箱功能不在本仓库中。Codex 插件本身只负责收件，不替你启动执行模型或判断业务验收。
 
 ### 交付与恢复
@@ -111,8 +113,8 @@ pwsh -NoProfile -File claude/bin/Dispatch.ps1 -Executor codex `
 - 0.3.1 支持可信启动包装器的明确启动前拒绝：登记后、调用执行者之前，写与本轮身份一致的 `PRELAUNCH_REJECTION.json`，账本将其转为失败/受阻回执，仍只交原 Lead 一次。[契约和示例](codex/README.md)规定证据与写入顺序；进程消失或缺少报告本身不能生成失败回执。
 - 0.3.2 明确拒绝 Windows 盘符相对等不明确附件路径。公开账本的合法相对附件一直以登记 outbox 为基准；本轮新增不同工作目录和同名外部诱饵的消费者回归检查，保留目录边界及旧交付保护。
 - claim 原子独占；sent 保留；持久精确收据可以只补 ack。同一任务与同一attempt只登记一份终态交付，异常恢复的新执行应使用新attempt和独立outbox。
-- 消息标注“此消息由收件系统自动投递”。App显示的发送身份是当前实例的实际会话身份，不代表该模型逐件读完并转发。
-- 多实例共用 OS 领班锁；无当前宿主管道或实际调用者身份时不扫描。
+- 消息标注“此消息由收件系统自动投递”。发送 actor 优先为当前实例真实身份；缺身份时仅明确 grant 可授权后台使用配置协调者身份，不代表该模型逐件读完并转发。
+- 多实例共用 OS 领班锁；缺本次宿主管道，或既无真实 actor 又无有效委托时不扫描。撤权后停止新领取和发送，已提交的发送保留收据并完成 ack。
 - 历史坏记录逐件隔离；故障和未送达的告警可见，单个坏件不阻塞其它交付。
 - 启停遵循用户明确授权和宿主正常审批；原生拒绝如实保存，不换路径绕过。
 
@@ -126,7 +128,7 @@ pwsh -NoProfile -File claude/bin/Dispatch.ps1 -Executor codex `
 
 - 原型和私有0.2.3已观察到：真实App安装/加载、原会话自动接续、首份真实任务报告被原Lead读取；普通桥曾运行34分46秒后接续。
 - 公共版本的自包含配置、账本和假宿主检查见 [codex/VALIDATION.md](codex/VALIDATION.md)，不公开私人测试实录。
-- notLoaded的真实投递、长期使用、完整更新/重启恢复，仍需各使用环境验证。精确收据不等于Lead已经阅读，收到报告也不等于业务已验收。
+- 公共0.4.0已沿 stdio/默认账本以假官方宿主验证显式grant后服务重建恢复；隔离CLI安装另行检查。完整Desktop关闭再打开、新真实交付和原Lead接续仍需各使用环境验证。宿主未加载服务或未提供pipe时，持久grant不能自行启动它。精确收据不等于Lead已经阅读，收到报告也不等于业务已验收。
 
 示例轮询为15–20秒，正在运行的Lead会话可能先等待。此项目不由OpenAI或Anthropic发布，也不包含其私有工具源码。配置参考：[Codex插件](https://developers.openai.com/plugins/build/plugins)、[MCP](https://learn.chatgpt.com/docs/extend/mcp)。
 

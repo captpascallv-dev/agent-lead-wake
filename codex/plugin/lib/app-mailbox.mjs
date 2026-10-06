@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { key } from './ids.mjs';
 import { readJson, writeJsonAtomic, createJsonOnce } from './store.mjs';
 import { exactSendReceipt } from './official-tools.mjs';
+import { BackgroundDelegation, identitySources, validWatchEpoch } from './delegation.mjs';
 
 const pluginRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const driverPath = path.join(pluginRoot, 'driver', 'mailbox_driver.py');
@@ -47,9 +48,11 @@ export class MailboxDriver {
       child.stdin.end(JSON.stringify({ operation, ...args }));
     });
   }
-  acquireLeader() {
+  acquireLeader() { return this.acquireLease('--lease'); }
+  acquireControl() { return this.acquireLease('--authorization-lease'); }
+  acquireLease(flag) {
     return new Promise((resolve, reject) => {
-      const argv = ['-B', '-X', 'utf8', driverPath, '--lease', '--root', this.root];
+      const argv = ['-B', '-X', 'utf8', driverPath, flag, '--root', this.root];
       const child = spawn(this.pythonPath, argv, { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
       this.children.add(child);
       const lease = { child, alive: false, release: () => { lease.alive = false; child.stdin.end(); } };
@@ -88,6 +91,8 @@ export class AppMailboxEngine {
     this.instanceId = randomUUID(); this.running = false; this.closed = false; this.busy = false; this.timer = null;
     this.actorThreadId = typeof env.CODEX_THREAD_ID === 'string' && env.CODEX_THREAD_ID.trim() ? env.CODEX_THREAD_ID : null;
     this.actorSource = this.actorThreadId ? 'launch_environment' : null;
+    this.pollActor = null;
+    this.delegationUse = null;
     this.leader = null; this.nextLeaderAttempt = 0; this.runtimeState = 'standby'; this.bridgeUnavailable = false;
     this.nextBridgeProbeAttempt = 0; this.bridgeProbe = null; this.lastBridgeProbe = null;
     this.client.onTransportFailure = error => this.bridgeFailed(error);
@@ -97,6 +102,8 @@ export class AppMailboxEngine {
     createJsonOnce(bindingPath, { mailboxRoot: this.root });
     const binding = readJson(bindingPath);
     if (!binding || binding._unreadable || binding.mailboxRoot !== this.root) throw new Error('Receiver state is bound to another or unreadable ledger. Use the same configured roots.');
+    this.delegation = new BackgroundDelegation({ stateDir: this.stateDir, mailboxRoot: this.root, coordinator: this.coordinator,
+      allWatch: () => this.allWatch(), iso: () => this.iso(), instanceId: this.instanceId });
     this.lastScan = readJson(path.join(this.stateDir, 'scan-status.json')) ?? { ready: [], held: [], uncertain: [], errors: [] };
   }
   iso() { return new Date(this.now()).toISOString(); }
@@ -106,14 +113,60 @@ export class AppMailboxEngine {
   faultPath(id, filename) { return path.join(this.stateDir, 'faults', id, filename); }
   bindActualCaller(owner, source = 'turn_metadata') {
     // Only a REAL tools/call may supply this fallback; never persisted permission.
-    if (!this.actorThreadId && typeof owner === 'string' && owner.trim()) {
-      this.actorThreadId = owner; this.actorSource = source === 'executor_environment' ? 'tool_executor_environment' : 'instance_tool_metadata'; this.nextLeaderAttempt = 0; this.kick();
+    if (!this.actorThreadId && Object.hasOwn(identitySources, source) && typeof owner === 'string' && owner.trim()) {
+      this.actorThreadId = owner; this.actorSource = identitySources[source]; this.delegationUse = null; this.nextLeaderAttempt = 0; this.kick();
     }
+  }
+  currentActor() {
+    if (this.actorThreadId) return { threadId: this.actorThreadId, source: this.actorSource, grantId: null };
+    const checked = this.delegation.inspect();
+    if (!checked.valid) { this.delegationUse = null; return null; }
+    const actor = { threadId: checked.record.delegateThreadId, source: 'persisted_delegation', grantId: checked.record.grantId };
+    this.delegationUse = actor;
+    return actor;
+  }
+  stillActing(actor) {
+    const current = this.currentActor();
+    return Boolean(actor && current && actor.threadId === current.threadId && actor.source === current.source && actor.grantId === current.grantId);
+  }
+  transportAuthorized(actor = this.pollActor) {
+    return !this.closed && Boolean(this.leader?.alive) && !this.bridgeUnavailable && this.client.pipePresent && this.stillActing(actor);
+  }
+  deliveryAuthorized(delivery, actor, epoch) {
+    if (!this.transportAuthorized(actor)) return false;
+    const route = this.routes()[delivery.project];
+    if (!route || route.thread_id !== delivery.target_thread_id) return false;
+    const permission = this.permission(delivery.project, route);
+    return Boolean(permission && permission.epoch === epoch);
+  }
+  delegationSummary(owner, checked = this.delegation.inspect()) {
+    const summary = { state: checked.state, reason: checked.reason,
+      inUseByThisInstance: Boolean(!this.actorThreadId && checked.valid && this.delegationUse?.grantId === checked.record.grantId) };
+    return owner === this.coordinator ? { ...summary, grantId: checked.record?.grantId ?? null } : summary;
+  }
+  async delegationControl(owner, source, operation) {
+    this.delegation.requireCoordinator(owner, source);
+    const lease = await this.driver.acquireControl();
+    if (!lease) throw new Error('Delegation control is busy; no permission changed. Retry the explicit tool call.');
+    try {
+      if (this.closed || !lease.alive) throw new Error('Service/control lease ended; no permission changed.');
+      return this.delegation[operation](owner, source);
+    } finally { lease.release(); }
+  }
+  async grantDelegation(owner, source) {
+    const outcome = await this.delegationControl(owner, source, 'grant');
+    this.nextLeaderAttempt = 0; this.kick();
+    return { outcome, delegation: this.delegationSummary(owner) };
+  }
+  async revokeDelegation(owner, source) {
+    const outcome = await this.delegationControl(owner, source, 'revoke');
+    if (!this.actorThreadId) { this.releaseLeader(); this.pollActor = null; this.delegationUse = null; }
+    return { outcome, delegation: this.delegationSummary(owner) };
   }
   leaderPath() { return path.join(this.stateDir, 'leader-status.json'); }
   publishLeader(state) {
-    writeJsonAtomic(this.leaderPath(), { schemaVersion: 1, instanceId: this.instanceId, actorThreadId: this.actorThreadId,
-      actorSource: this.actorSource, state, atUtc: this.iso() });
+    writeJsonAtomic(this.leaderPath(), { schemaVersion: 1, instanceId: this.instanceId, actorThreadId: this.pollActor?.threadId ?? this.actorThreadId,
+      actorSource: this.pollActor?.source ?? this.actorSource, delegationGrantId: this.pollActor?.grantId ?? null, state, atUtc: this.iso() });
   }
   releaseLeader() {
     if (this.leader?.alive && readJson(this.leaderPath())?.instanceId === this.instanceId) this.publishLeader('released');
@@ -129,17 +182,18 @@ export class AppMailboxEngine {
     return confirmed;
   }
   async recoverBridge() {
-    if (this.closed || !this.client.pipePresent || !this.actorThreadId) return false;
+    const actor = this.currentActor();
+    if (this.closed || !this.client.pipePresent || !actor) return false;
     if (this.bridgeProbe) return this.bridgeProbe;
     if (this.now() < this.nextBridgeProbeAttempt) return false;
     this.nextBridgeProbeAttempt = this.now() + 60000;
-    this.lastBridgeProbe = { actorThreadId: this.actorThreadId, attemptAtUtc: this.iso(), status: 'checking' };
+    this.lastBridgeProbe = { actorThreadId: actor.threadId, actorSource: actor.source, attemptAtUtc: this.iso(), status: 'checking' };
     // Only standard handshake plus a read of THIS actual actor. The client uses
     // its original launch-env snapshot; no persisted/new/guessed pipe or send.
     this.bridgeProbe = (async () => {
       try {
-        await this.client.readThread(this.actorThreadId, this.actorThreadId);
-        if (this.closed) return false;
+        await this.client.readThread(actor.threadId, actor.threadId, () => !this.closed && this.stillActing(actor));
+        if (this.closed || !this.stillActing(actor)) return false;
         this.bridgeUnavailable = false; this.runtimeState = 'standby'; this.nextLeaderAttempt = 0;
         this.lastBridgeProbe = { ...this.lastBridgeProbe, status: 'verified', verifiedAtUtc: this.iso() };
         return true;
@@ -152,18 +206,20 @@ export class AppMailboxEngine {
     try { return await this.bridgeProbe; } finally { this.bridgeProbe = null; }
   }
   async canPoll() {
-    if (!this.client.pipePresent) { this.runtimeState = 'no_pipe'; this.releaseLeader(); return false; }
-    if (!this.actorThreadId) { this.runtimeState = 'identity_unavailable'; this.releaseLeader(); return false; }
+    if (!this.client.pipePresent) { this.runtimeState = 'no_pipe'; this.releaseLeader(); this.pollActor = null; return false; }
+    const actor = this.currentActor();
+    if (!actor) { this.runtimeState = 'identity_unavailable'; this.releaseLeader(); this.pollActor = null; return false; }
+    this.pollActor = actor;
     if (this.bridgeUnavailable) {
       this.runtimeState = 'adapter_unavailable'; this.releaseLeader();
-      if (!await this.recoverBridge()) return false;
+      if (!await this.recoverBridge() || !this.stillActing(actor)) return false;
     }
     if (!this.leader?.alive) {
       this.runtimeState = 'standby';
       if (this.now() < this.nextLeaderAttempt) return false;
       this.nextLeaderAttempt = this.now() + 60000;
       this.leader = await this.driver.acquireLeader();
-      if (this.closed || this.bridgeUnavailable || !this.client.pipePresent || !this.actorThreadId) { this.releaseLeader(); return false; }
+      if (this.closed || this.bridgeUnavailable || !this.client.pipePresent || !this.stillActing(actor)) { this.releaseLeader(); return false; }
     }
     this.runtimeState = this.leader?.alive ? 'leader' : 'standby';
     if (this.runtimeState === 'leader') this.publishLeader('leader');
@@ -171,7 +227,8 @@ export class AppMailboxEngine {
   }
   allWatch() {
     const value = readJson(this.allPath());
-    if (value?._unreadable) throw new Error('Stored all-watch permission is unreadable; no scanning or send.');
+    if (fs.existsSync(this.allPath()) && (!value || value._unreadable || typeof value !== 'object' || Array.isArray(value)
+      || value.schemaVersion !== 1 || typeof value.enabled !== 'boolean' || !validWatchEpoch(value.epoch))) throw new Error('Stored all-watch permission is unreadable or invalid; no scanning or send.');
     return value ?? { enabled: false, epoch: 'initial', registeredBy: null };
   }
   routes() {
@@ -285,11 +342,17 @@ export class AppMailboxEngine {
       const intent = readJson(this.faultPath(id, 'intent.json'));
       return [{ ...value, notificationState: outcome?.status ?? (intent ? 'uncertain' : 'pending'), outcomePath: this.faultPath(id, 'outcome.json') }];
     });
+    // Read-only status never adopts or creates delegation, nor revives permission.
+    const checkedDelegation = this.delegation.inspect();
+    const effectiveActor = this.actorThreadId ? { threadId: this.actorThreadId, source: this.actorSource }
+      : checkedDelegation.valid ? { threadId: checkedDelegation.record.delegateThreadId, source: 'persisted_delegation' } : null;
     return { service: { adapter: 'registered-ledger', mailboxRoot: this.root, defaultOff: true, running: this.running,
       pipePresent: this.client.pipePresent, adapterStatus: this.client.adapterStatus ?? null,
-      runtimeState: !this.client.pipePresent ? 'no_pipe' : !this.actorThreadId ? 'identity_unavailable'
+      runtimeState: !this.client.pipePresent ? 'no_pipe' : !effectiveActor ? 'identity_unavailable'
         : this.bridgeUnavailable ? 'adapter_unavailable' : this.leader?.alive ? 'leader' : 'standby',
-      actorThreadId: this.actorThreadId, actorSource: this.actorSource, nextLeaderAttemptUtc: new Date(this.nextLeaderAttempt).toISOString(),
+      actorThreadId: effectiveActor?.threadId ?? null, actorSource: effectiveActor?.source ?? null,
+      actualActor: { threadId: this.actorThreadId, source: this.actorSource }, delegation: this.delegationSummary(owner, checkedDelegation),
+      nextLeaderAttemptUtc: new Date(this.nextLeaderAttempt).toISOString(),
       observedLeader: readJson(this.leaderPath()),
       bridgeHealth: { lastProbe: this.lastBridgeProbe, nextProbeAtUtc: this.bridgeUnavailable ? new Date(this.nextBridgeProbeAttempt).toISOString() : null,
         sameLaunchEnvironmentOnly: true },
@@ -355,8 +418,9 @@ export class AppMailboxEngine {
     writeJsonAtomic(filename, next);
   }
   async flushFaults() {
+    const actor = this.pollActor;
     for (const faultId of fs.readdirSync(path.join(this.stateDir, 'faults'))) {
-      if (this.closed || !this.leader?.alive || this.bridgeUnavailable || !this.client.pipePresent || !this.actorThreadId) return;
+      if (!this.transportAuthorized(actor)) return;
       const fault = readJson(this.faultPath(faultId, 'fault.json'));
       if (!fault || fault._unreadable) continue;
       const outcomePath = this.faultPath(faultId, 'outcome.json');
@@ -371,10 +435,23 @@ export class AppMailboxEngine {
         continue;
       }
       const prompt = `[app-mailbox-transport-fault:${faultId}]\n此消息由收件系统自动投递。\nid: ${fault.deliveryId}\nproject: ${fault.project}\nreason: ${fault.reason}\nstate: ${fault.relatedStatePath}\nDelivery retained; inspect original state. No automatic resend.`;
+      const route = this.routes()[fault.project];
+      const permission = route && this.permission(fault.project, route);
+      if (!permission) continue;
+      // A transport fault may describe an OLD registered owner after handoff.
+      // Its destination remains coordinator, while the project permit is current.
+      const authorized = () => {
+        if (!this.transportAuthorized(actor)) return false;
+        const currentRoute = this.routes()[fault.project];
+        return Boolean(currentRoute && this.permission(fault.project, currentRoute)?.epoch === permission.epoch);
+      };
+      if (!authorized()) return;
       if (!createJsonOnce(intentPath, { schemaVersion: 1, faultId, coordinatorThreadId: this.coordinator,
-        actorThreadId: this.actorThreadId, instanceId: this.instanceId, intentAtUtc: this.iso(), sentFields: ['threadId', 'prompt'], metadataFields: ['x-codex-turn-metadata.thread_id'] })) continue;
+        actorThreadId: actor.threadId, actorSource: actor.source, delegationGrantId: actor.grantId,
+        instanceId: this.instanceId, intentAtUtc: this.iso(), sentFields: ['threadId', 'prompt'], metadataFields: ['x-codex-turn-metadata.thread_id'] })) continue;
       try {
-        const receipt = await this.client.send(this.coordinator, prompt, this.actorThreadId);
+        if (!authorized()) throw new Error('Fault authorization ended before send; intent retained without retry.');
+        const receipt = await this.client.send(this.coordinator, prompt, actor.threadId, authorized);
         createJsonOnce(this.faultPath(faultId, 'receipt.json'), receipt);
         createJsonOnce(outcomePath, { faultId, status: receipt?.isError ? 'rejected' : exactSendReceipt(receipt, this.coordinator) ? 'accepted' : 'uncertain',
           atUtc: this.iso(), reason: 'Fault notification attempted once; receipt retained without retry.' });
@@ -427,26 +504,31 @@ export class AppMailboxEngine {
     }
   }
   async processReady(item) {
-    if (this.closed || !this.leader?.alive || this.bridgeUnavailable || !this.actorThreadId) return;
+    const actor = this.pollActor;
+    if (!this.transportAuthorized(actor)) return;
     let delivery = this.delivery(item.id); const route = this.exactRoute(delivery);
     const permission = this.permission(delivery.project, route);
     if (!permission || delivery.state !== 'pending') return;
     if (fs.existsSync(path.join(this.root, 'claims', `${delivery.id}.lock`))) return;
     if (!this.client.pipePresent) return;
-    const caller = this.actorThreadId;
+    const caller = actor.threadId;
+    const authorized = () => this.deliveryAuthorized(delivery, actor, permission.epoch);
+    if (!authorized()) return;
     let observed;
-    try { observed = await this.client.readThread(delivery.target_thread_id, caller); }
+    try { observed = await this.client.readThread(delivery.target_thread_id, caller, authorized); }
     catch (error) {
+      if (!authorized()) return;
       this.observeBlocked(delivery, 'read_unavailable', `Preflight unavailable; central pending retained: ${String(error).slice(0, 300)}`);
       this.bridgeFailed(error); return;
     }
+    if (!authorized()) return;
     const ownerStatus = observed.thread.status?.type ?? 'unknown';
     if (!['idle', 'notLoaded'].includes(ownerStatus)) {
       this.observeBlocked(delivery, ownerStatus, `Original owner status ${ownerStatus}; central pending retained.`); return;
     }
     writeJsonAtomic(this.localPath(delivery.id, 'wait.json'), { deliveryId: delivery.id, ownerStatus, blockedSinceUtc: null, lastObservedAtUtc: this.iso() });
     delivery = this.delivery(item.id); const latestRoute = this.exactRoute(delivery);
-    if (this.closed || !this.leader?.alive || !this.permission(delivery.project, latestRoute)) return;
+    if (!this.permission(delivery.project, latestRoute) || !authorized()) return;
     let claimed;
     try {
       const response = await this.driver.run('claim', { id: delivery.id });
@@ -456,13 +538,15 @@ export class AppMailboxEngine {
       if (claimed.id !== delivery.id || claimed.project !== delivery.project || claimed.state !== 'sending'
         || claimed.target_thread_id !== delivery.target_thread_id || typeof claimed.prompt !== 'string') throw new Error('Claim identity/owner/prompt differs from the registered delivery.');
       this.exactRoute(claimed);
-      if (this.closed || !this.leader?.alive || !this.permission(claimed.project, this.routes()[claimed.project])) throw new Error('Watch/leader stopped after central claim; retain sending without sending.');
+      if (!authorized()) throw new Error('Watch/leader/delegation stopped after central claim; retain sending without sending.');
       const intent = { schemaVersion: 1, deliveryId: claimed.id, project: claimed.project,
-        ownerThreadId: claimed.target_thread_id, callerThreadId: caller, permissionRegisteredBy: permission.registeredBy, actorSource: this.actorSource, instanceId: this.instanceId,
+        ownerThreadId: claimed.target_thread_id, callerThreadId: caller, permissionRegisteredBy: permission.registeredBy, actorSource: actor.source,
+        delegationGrantId: actor.grantId, instanceId: this.instanceId,
         intentAtUtc: this.iso(), sentFields: ['threadId', 'prompt'],
         metadataFields: ['x-codex-turn-metadata.thread_id'] };
       if (!createJsonOnce(this.localPath(claimed.id, 'intent.json'), intent)) throw new Error('Existing receiver intent retained; no automatic resend.');
-      const receipt = await this.client.send(claimed.target_thread_id, claimed.prompt, caller);
+      if (!authorized()) throw new Error('Authorization ended before send; intent retained without resend.');
+      const receipt = await this.client.send(claimed.target_thread_id, claimed.prompt, caller, authorized);
       createJsonOnce(this.localPath(claimed.id, 'receipt.json'), receipt);
       if (!exactSendReceipt(receipt, claimed.target_thread_id)) {
         this.localOutcome(claimed.id, 'uncertain', { reason: receipt?.isError ? 'Official send rejected; central sending/lock retained.' : 'No exact owner acceptance; central sending/lock retained.' }, claimed); return;
@@ -480,10 +564,11 @@ export class AppMailboxEngine {
     try {
       if (!await this.canPoll()) return;
       await this.recoverLocalReceipts();
+      if (!this.transportAuthorized()) return;
       const routes = this.routes();
       if (!Object.entries(routes).some(([project, route]) => this.permission(project, route))) { await this.flushFaults(); return; }
       const scanned = await this.driver.run('scan');
-      if (scanned.busy) return;
+      if (scanned.busy || !this.transportAuthorized()) return;
       const scan = scanned.result;
       const errors = (scan.errors ?? []).map(item => {
         if (!item.job_file) return item;
@@ -495,6 +580,7 @@ export class AppMailboxEngine {
       writeJsonAtomic(path.join(this.stateDir, 'scan-status.json'), this.lastScan);
       this.observeCollectorErrors(errors);
       for (const item of scan.uncertain ?? []) {
+        if (!this.transportAuthorized()) break;
         try {
           const delivery = this.delivery(item.id); const route = this.exactRoute(delivery);
           if (!this.permission(delivery.project, route)) continue;
@@ -508,7 +594,7 @@ export class AppMailboxEngine {
         } catch (error) { errors.push({ id: item.id, project: item.project, error: String(error) }); }
       }
       for (const item of scan.ready ?? []) {
-        if (!this.leader?.alive || this.bridgeUnavailable || this.closed) break;
+        if (!this.transportAuthorized()) break;
         try { await this.processReady(item); }
         catch (error) { errors.push({ id: item.id, project: item.project, error: String(error) }); }
       }
@@ -518,7 +604,12 @@ export class AppMailboxEngine {
     } catch (error) {
       this.lastScan = { ...this.lastScan, atUtc: this.iso(), errors: [{ source: 'receiver', error: String(error) }] };
       writeJsonAtomic(path.join(this.stateDir, 'scan-status.json'), this.lastScan);
-    } finally { this.busy = false; }
+    } finally {
+      if (this.pollActor && !this.stillActing(this.pollActor)) {
+        this.releaseLeader(); this.pollActor = null; this.runtimeState = this.currentActor() ? 'standby' : 'identity_unavailable';
+      }
+      this.busy = false;
+    }
   }
   kick() { if (this.running && !this.closed && !this.busy) setTimeout(() => void this.tick(), 0); }
   start() {

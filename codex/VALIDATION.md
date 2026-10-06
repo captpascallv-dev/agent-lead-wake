@@ -1,3 +1,40 @@
+# Public Codex 0.4.0 validation
+
+Actual environment: Windows / Node v24.19.0 / Python 3.12.10 / Codex CLI 0.160.1. This run covers the public package, bundled ledger, fake official-tool dependency and isolated CLI installation. Earlier evidence below is retained as historical reference. Private deployment tests are separate and are not public Desktop acceptance.
+
+From the repository root:
+
+```text
+npm --prefix codex/plugin test
+node codex/tools/check-public.mjs
+```
+
+The public suite passed (15 tests, exit 0); the structure/syntax check passed (exit 0), with version 0.4.0 and five reception tools. The public commands use temporary synthetic ledger/state/outboxes and the repository's own fake MCP host, not copied official server code. No real pipe, model/provider, production account configuration or real notification was operated.
+
+| Public consumer check | Observed result |
+| --- | --- |
+| Formal grant and caller boundary | Only actual metadata/executor-environment identity matching configured coordinator can grant/revoke. Both tools accept no arguments and use manifest prompt approval. No enabled all-watch means no grant. Duplicate valid grant leaves grant and epoch unchanged; lock contention changes nothing. Persistent delegation does not identify an ordinary tools/call. Malformed metadata does not fall back to environment. |
+| Standard stdio reconstruction | First standard server explicitly receives coordinator start/grant, then exits through stdin EOF. A new standard server with no startup actor and no tools/call/hook uses the valid grant and its own synthetic launch pipe. Registered CLI and Bot READY deliveries go once to the exact original owner, with byte-identical claim prompt, original report and automatic label. State records persisted_delegation and the grant ID. |
+| Fail-closed scope and precedence | No grant/old registrar alone, null/array/malformed records, bad schema/identity/source/roots/epoch and missing launch pipe cannot scan in an identity-less receiver. Launch actor and this instance's real tool actor retain priority. |
+| Revoke, stop and projects | Revocation releases the delegated leader and prevents new collection; startup/status do not revive it. Stop-all disables the grant; a new all-watch epoch requires another explicit grant. Idempotent all-start preserves project opt-out. Held/closed routes remain paused. |
+| Await boundaries | Revocation after OS lease/scan/read/claim, before intent/send submission and after bridge connect stops new effects. A central claim already taken is kept without sending. A delayed fake send already submitted before revoke retains the real stub receipt and completes ack; the next delivery stays pending. |
+| Leader, receipts and faults | Two real stdio test instances without actor/tool calls share one OS leader and send each delivery once. Lease exit permits delegated standby takeover. Unknown sending stays manual_review_required; exact prior receipt completes only ack. Faults notify coordinator once, including an old registered owner's collector error after route handoff. |
+| Preserved public behavior | Existing configuration, CLI/Bot original reports, scoped status, immutable registrations/outboxes, short driver locks/permanent claims, timeout recovery, crash-before-ack, prelaunch rejection and Windows relative attachment consumers still pass. |
+
+Normal CLI installation was separately performed in a fresh temporary CODEX_HOME, without inherited launch pipe/actor, authentication or provider calls:
+
+```text
+codex plugin marketplace add <checkout> --json
+codex plugin add codex-mail-wake@agent-lead-wake --json
+codex mcp list --json
+```
+
+All commands exited 0. Installation reported version 0.4.0 and discovered codex_mail_wake using the installed local cache. Installed package and plugin versions, manifest approval modes, standard stdio initialize and tools/list all agreed: five tools, zero-argument grant/revoke schemas. An installed service call without actual identity refused grant and created no delegation. The active user profile was unchanged. This confirms CLI package registration, installation and discovery, not actual Desktop loading. Raw output stays outside the public tree.
+
+Still unverified for this public package: full Desktop/App shutdown and reload after grant, host eager loading, a new real delivery on the new real pipe, official-tool/notLoaded send, original Lead continuation, minimum runtimes and Ubuntu/macOS execution/locking. A persistent grant cannot load an unloaded MCP service or supply a missing launch pipe. Successful private grant/leader recovery or a read-only bridge probe does not prove this full lifecycle. Receipt acceptance is transport evidence, not reading or business acceptance.
+
+## Preserved 0.3.2 evidence
+
 # Public Codex 0.3.2 validation
 
 Actual environment: Windows / Node v24.19.0 / Python 3.12.10. Legal relative deliverables were already resolved from the registered outbox. This version rejects ambiguous Windows drive-relative and root-relative anchors before join, and adds one real CLI consumer regression. The 0.3.1 and 0.3.0 sections below stay as earlier evidence. They are not recounted as this run. Private adapter trials are separate and are not included here.

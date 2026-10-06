@@ -9,7 +9,9 @@
       "tool_timeout_sec": 30,
       "tools": {
         "start_app_mailbox_watch": { "approval_mode": "prompt" },
-        "stop_app_mailbox_watch": { "approval_mode": "prompt" }
+        "stop_app_mailbox_watch": { "approval_mode": "prompt" },
+        "grant_app_mailbox_delegation": { "approval_mode": "prompt" },
+        "revoke_app_mailbox_delegation": { "approval_mode": "prompt" }
       }
     }
   }

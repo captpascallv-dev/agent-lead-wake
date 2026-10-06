@@ -10,7 +10,7 @@ import readline from 'node:readline';
 import { loadConfig } from '../plugin/lib/config.mjs';
 import { AppMailboxEngine, MailboxDriver } from '../plugin/lib/app-mailbox.mjs';
 import { OfficialTools, resolveInstalledOfficialEntry } from '../plugin/lib/official-tools.mjs';
-import { handleRequest, TOOLS } from '../plugin/lib/mcp-service.mjs';
+import { handleRequest, TOOLS, GRANT_DELEGATION_TOOL as GRANT, REVOKE_DELEGATION_TOOL as REVOKE } from '../plugin/lib/mcp-service.mjs';
 import { readJson, createJsonOnce } from '../plugin/lib/store.mjs';
 import { key } from '../plugin/lib/ids.mjs';
 
@@ -80,7 +80,7 @@ test('configuration and MCP identity fail closed; absent launch pipe or actor ca
   const f = fixture(t);
   const homes = { CODEX_HOME: path.join(f.base, 'default-home'), HOME: f.base, USERPROFILE: f.base };
   assert.throws(() => loadConfig(homes), /configuration is required/);
-  assert.equal(TOOLS.length, 3); assert.ok(TOOLS.every(tool => !tool.name.includes('subscription')));
+  assert.equal(TOOLS.length, 5); assert.ok(TOOLS.every(tool => !tool.name.includes('subscription')));
   const missing = spawnSync(process.execPath, [path.join(root, 'plugin', 'server.mjs')], { env: homes, encoding: 'utf8', windowsHide: true });
   assert.equal(missing.status, 1); assert.ok(missing.stderr.includes('configuration is required'));
   const standard = { mailboxRoot: '../ledger', stateDir: '../state', coordinatorThreadId: coordinator, pythonExecutable: python };
@@ -193,13 +193,19 @@ test('uncertain intent and missing history stay single-attempt while same-pipe a
   assert.ok(events(f).every(event => event.pipe === 'test-launch-pipe'));
 });
 
-function service(f, filename) {
-  const child = spawn(process.execPath, [filename], { env: f.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+function service(f, filename, env = f.env) {
+  const child = spawn(process.execPath, [filename], { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
   let sequence = 0; const pending = new Map(); let stderr = '';
   child.stderr.on('data', data => { stderr += data; });
   readline.createInterface({ input: child.stdout }).on('line', line => { const result = JSON.parse(line); const operation = pending.get(result.id); if (operation) { pending.delete(result.id); operation.resolve(result.result); } });
-  const call = (method, params = {}) => new Promise(resolve => { const id = ++sequence; pending.set(id, { resolve }); child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`); });
-  return { child, call, stderr: () => stderr };
+  let toolCalls = 0;
+  const call = (method, params = {}) => new Promise((resolve, reject) => {
+    if (method === 'tools/call') toolCalls++;
+    const id = ++sequence; const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Test service timeout: ${method}; ${stderr}`)); }, 10000);
+    pending.set(id, { resolve: value => { clearTimeout(timer); resolve(value); } });
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+  });
+  return { child, call, toolCalls: () => toolCalls, stderr: () => stderr };
 }
 
 test('standard stdio process restart recovers durable exact receipt with ack only; installed dependency lookup stays in current cache', async t => {
@@ -208,12 +214,12 @@ test('standard stdio process restart recovers durable exact receipt with ack onl
   assert.throws(() => resolveInstalledOfficialEntry({ cacheRoot: cache, appToolsEntry: path.join(root, 'tests', 'fixtures', 'fake-host.mjs') }), /valid server.mjs/);
   const first = service(f, path.join(root, 'tests', 'fixtures', 'crash-service.mjs')); let second;
   try {
-    assert.equal((await first.call('initialize')).serverInfo.version, '0.3.2');
+    assert.equal((await first.call('initialize')).serverInfo.version, '0.4.0');
     await first.call('tools/call', { name: 'start_app_mailbox_watch', arguments: { project: 'demo' }, _meta: { 'x-codex-turn-metadata': { thread_id: owner } } });
     await until(() => first.child.exitCode === 17); assert.equal(deliveries(f).length, 1); assert.equal(central(f, item.id).state, 'sending');
     second = service(f, path.join(root, 'plugin', 'server.mjs')); await second.call('initialize');
     await until(() => central(f, item.id).state === 'sent'); assert.equal(deliveries(f).length, 1);
-    assert.equal((await second.call('tools/list')).tools.length, 3); assert.equal(second.stderr(), '');
+    assert.equal((await second.call('tools/list')).tools.length, 5); assert.equal(second.stderr(), '');
   } finally {
     if (first.child.exitCode === null) { first.child.kill(); await once(first.child, 'close'); }
     if (second) { second.child.stdin.end(); await once(second.child, 'close'); }
@@ -365,4 +371,221 @@ test('legal relative attachments snapshot the registered outbox from an independ
   assert.equal(again.uncertain.some(item => item.id === keptSending.id), true);
   assert.equal(again.ready.concat(again.uncertain).some(item => item.id === keptSent.id), false);
   assert.equal(process.cwd(), cwdBefore);
+});
+const tool = (e, name, args = {}, who = coordinator, env = {}) => handleRequest({ jsonrpc: '2.0', method: 'tools/call', params: {
+  name, arguments: args, ...(who === null ? {} : { _meta: { 'x-codex-turn-metadata': { thread_id: who } } }),
+} }, e, env);
+const toolValue = result => { assert.equal(result.isError, false, result.content[0].text); return JSON.parse(result.content[0].text); };
+const delegated = (f, options = {}) => engine(f, { env: {}, ...options });
+async function permitAndGrant(f) {
+  const admin = engine(f); admin.startWatch(coordinator);
+  const value = toolValue(await tool(admin, GRANT)); admin.close(); await pause(50);
+  return value.delegation.grantId;
+}
+async function stopService(s) {
+  if (s && s.child.exitCode === null) { s.child.stdin.end(); await once(s.child, 'close'); }
+}
+const deliverySends = (f, id) => deliveries(f).filter(item => item.params.arguments.prompt.startsWith(`[app-mailbox:${id}]`));
+
+test('explicit delegation tools require actual coordinator identity, no overrides and a valid existing all-watch epoch', async t => {
+  const f = fixture(t); const e = delegated(f);
+  for (const name of [GRANT, REVOKE]) {
+    const spec = TOOLS.find(item => item.name === name);
+    assert.deepEqual(spec.inputSchema, { type: 'object', additionalProperties: false, properties: {} });
+    assert.equal(spec.annotations.readOnlyHint, false);
+  }
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'plugin', '.mcp.json'), 'utf8'));
+  for (const name of [GRANT, REVOKE]) assert.equal(manifest.mcpServers.codex_mail_wake.tools[name].approval_mode, 'prompt');
+  assert.equal((await tool(e, GRANT)).isError, true);
+  assert.equal(readJson(e.delegation.filename), null); assert.equal(e.allWatch().enabled, false);
+  toolValue(await tool(e, 'start_app_mailbox_watch'));
+  for (const name of [GRANT, REVOKE]) {
+    assert.equal((await tool(e, name, {}, owner)).isError, true);
+    assert.equal((await tool(e, name, {}, null)).isError, true);
+    for (const field of ['caller', 'actor', 'target', 'pipe', 'root', 'stateDir', 'model', 'host', 'project']) assert.equal((await tool(e, name, { [field]: 'override' })).isError, true);
+  }
+  const before = fs.readFileSync(e.allPath(), 'utf8');
+  const grant = toolValue(await tool(e, GRANT)); assert.equal(grant.outcome, 'granted');
+  const record = fs.readFileSync(e.delegation.filename, 'utf8');
+  assert.equal(toolValue(await tool(e, GRANT)).outcome, 'already_active_same_scope');
+  assert.equal(fs.readFileSync(e.delegation.filename, 'utf8'), record);
+  assert.equal(fs.readFileSync(e.allPath(), 'utf8'), before, 'grant never changes permission or epoch');
+  assert.equal((await tool(e, 'app_mailbox_status', {}, null)).isError, true, 'persistent delegation never becomes a tools/call identity');
+  const wrongMeta = await handleRequest({ jsonrpc: '2.0', method: 'tools/call', params: { name: GRANT, arguments: {},
+    _meta: { 'x-codex-turn-metadata': {} } } }, e, { CODEX_THREAD_ID: coordinator });
+  assert.equal(wrongMeta.isError, true, 'bad metadata never falls back to environment');
+  assert.equal(toolValue(await tool(e, REVOKE)).outcome, 'revoked');
+  assert.equal(toolValue(await tool(e, REVOKE)).outcome, 'already_revoked');
+  const fromEnv = toolValue(await tool(e, GRANT, {}, null, { CODEX_THREAD_ID: coordinator }));
+  assert.notEqual(fromEnv.delegation.grantId, grant.delegation.grantId);
+  assert.equal(readJson(e.delegation.filename).grantedBySource, 'tool_executor_environment');
+  const lock = await e.driver.acquireControl();
+  assert.ok(lock); assert.equal((await tool(e, REVOKE)).isError, true, 'another control cannot overwrite while OS lock held');
+  lock.release();
+});
+
+test('public stdio grant then service reload with no actor or tools/call resumes exact registered CLI/Bot delivery', async t => {
+  let first, second;
+  t.after(async () => { await stopService(first); await stopService(second); });
+  const f = fixture(t); write(f.config, { ...JSON.parse(fs.readFileSync(f.config)), pollIntervalMs: 1000 });
+  const env = { ...f.env }; delete env.CODEX_THREAD_ID;
+  first = service(f, path.join(root, 'plugin', 'server.mjs'), env);
+  assert.equal((await first.call('initialize')).serverInfo.version, '0.4.0');
+  const params = name => ({ name, arguments: {}, _meta: { 'x-codex-turn-metadata': { thread_id: coordinator } } });
+  toolValue(await first.call('tools/call', params('start_app_mailbox_watch')));
+  const grantId = toolValue(await first.call('tools/call', params(GRANT))).delegation.grantId;
+  await stopService(first);
+  const cliJob = job(f, 'reload-cli'); const botJob = job(f, 'reload-bot', '1', 'bot');
+  write(f.control, { ownerStatus: 'notLoaded' });
+  second = service(f, path.join(root, 'plugin', 'server.mjs'), { ...env, CODEX_APP_TOOLS_PIPE_PATH: 'second-launch-pipe' });
+  await second.call('initialize'); assert.equal((await second.call('tools/list')).tools.length, 5);
+  await until(() => [cliJob, botJob].every(item => central(f, item.id)?.state === 'sent'));
+  assert.equal(second.toolCalls(), 0, 'startup/list only, no identity-binding call or hook');
+  for (const item of [cliJob, botJob]) {
+    const sent = deliverySends(f, item.id); assert.equal(sent.length, 1);
+    assert.equal(sent[0].params.arguments.prompt, central(f, item.id).prompt);
+    assert.equal(sent[0].params.arguments.threadId, owner);
+    assert.equal(sent[0].params._meta['x-codex-turn-metadata'].thread_id, coordinator);
+    assert.deepEqual(Object.keys(sent[0].params.arguments).sort(), ['prompt', 'threadId']);
+    assert.equal(sent[0].pipe, 'second-launch-pipe');
+    const intent = readJson(path.join(f.stateDir, 'app-mailbox', 'deliveries', key(item.id), 'intent.json'));
+    assert.equal(intent.actorSource, 'persisted_delegation'); assert.equal(intent.delegationGrantId, grantId);
+    assert.ok(sent[0].params.arguments.prompt.includes(fs.readFileSync(path.join(item.outbox, 'REPORT.md'), 'utf8')));
+  }
+  assert.equal(second.stderr(), '');
+  assert.equal(readJson(path.join(f.stateDir, 'app-mailbox', 'leader-status.json')).actorSource, 'persisted_delegation');
+});
+
+test('delegation refuses missing or malformed grants, scope mismatch, missing pipe and stale epoch; actual actor has priority', async t => {
+  const f = fixture(t); const e = delegated(f); e.startWatch(coordinator); const item = job(f);
+  await e.tick(); assert.equal(central(f, item.id), null, 'registeredBy alone is never delegation');
+  toolValue(await tool(e, GRANT)); const good = readJson(e.delegation.filename); e.close(); await pause(50);
+  const variants = [null, [], {}, { ...good, schemaVersion: 99 }, { ...good, grantedBy: owner }, { ...good, delegateThreadId: owner },
+    { ...good, grantedBySource: 'persisted_delegation' }, { ...good, grantId: 'bad' }, { ...good, createdAtUtc: 'bad' },
+    { ...good, scope: { ...good.scope, stateRoot: path.join(f.base, 'other-state') } },
+    { ...good, scope: { ...good.scope, mailboxRoot: path.join(f.base, 'other-ledger') } },
+    { ...good, scope: { ...good.scope, allWatchEpoch: 'old-epoch' } }];
+  for (const variant of variants) {
+    write(e.delegation.filename, variant); const instance = delegated(f); await instance.tick();
+    assert.equal(central(f, item.id), null); assert.equal(instance.runtimeState, 'identity_unavailable'); instance.close();
+  }
+  write(e.delegation.filename, good); const goodWatch = readJson(e.allPath());
+  for (const watch of [null, [], { ...goodWatch, enabled: 'true' }, { ...goodWatch, registeredBy: owner }, { ...goodWatch, epoch: 'initial' }]) {
+    write(e.allPath(), watch); const instance = delegated(f); await instance.tick();
+    assert.equal(central(f, item.id), null); assert.equal(instance.runtimeState, 'identity_unavailable'); instance.close();
+  }
+  write(e.allPath(), goodWatch);
+  fs.writeFileSync(e.delegation.filename, '{'); const invalid = delegated(f); await invalid.tick();
+  assert.equal((await tool(invalid, GRANT)).isError, true); toolValue(await tool(invalid, REVOKE)); invalid.close();
+  write(e.delegation.filename, good);
+  const noPipe = delegated(f, { client: new OfficialTools({ env: { ...f.env, CODEX_APP_TOOLS_PIPE_PATH: '' } }) });
+  await noPipe.tick(); assert.equal(central(f, item.id), null); assert.equal(noPipe.runtimeState, 'no_pipe'); noPipe.close();
+  const real = engine(f); await real.tick(); assert.equal(central(f, item.id).state, 'sent');
+  assert.equal(readJson(real.localPath(item.id, 'intent.json')).actorSource, 'launch_environment');
+  assert.equal(readJson(real.localPath(item.id, 'intent.json')).delegationGrantId, null); real.close(); await pause(50);
+  const fallback = delegated(f); toolValue(await tool(fallback, 'app_mailbox_status', { project: 'demo' }, owner));
+  const next = job(f, 'real-tool-priority'); await fallback.tick();
+  assert.equal(readJson(fallback.localPath(next.id, 'intent.json')).actorSource, 'instance_tool_metadata');
+  assert.equal(deliverySends(f, next.id)[0].params._meta['x-codex-turn-metadata'].thread_id, owner);
+});
+
+test('revoke, stop-all and epoch change cannot be revived by startup or status; opt-out and held/closed routes stay paused', async t => {
+  const f = fixture(t); const grantId = await permitAndGrant(f); const d = delegated(f); let at = Date.now(); d.now = () => at;
+  const first = job(f, 'first'); await d.tick(); assert.equal(central(f, first.id).state, 'sent');
+  const admin = engine(f); admin.stopWatch(owner, { project: 'demo' }); const paused = job(f, 'opt-out');
+  for (const status of ['held', 'closed']) {
+    cli(f, ['route', '--project', status, '--owner', owner]);
+    const outbox = path.join(f.base, status); fs.mkdirSync(outbox); fs.writeFileSync(path.join(outbox, 'REPORT.md'), status);
+    write(path.join(outbox, 'READY.json'), { status: 'completed', deliverables: [] });
+    cli(f, ['register', '--project', status, '--job', 'paused', '--attempt', '1', '--outbox', outbox]);
+    cli(f, ['route', '--project', status, '--owner', owner, '--status', status]);
+  }
+  await d.tick(); assert.equal(deliverySends(f, paused.id).length, 0);
+  assert.equal(admin.startWatch(coordinator).projects.find(p => p.project === 'demo').watchEnabled, false, 'idempotent all-start preserves opt-out');
+  admin.startWatch(owner, { project: 'demo' });
+  toolValue(await tool(admin, REVOKE)); const afterRevoke = job(f, 'revoked'); await d.tick();
+  assert.equal(d.leader, null); assert.equal(central(f, afterRevoke.id), null);
+  assert.equal(d.getStatus(coordinator).service.delegation.state, 'revoked');
+  const fresh = delegated(f); await fresh.tick(); assert.equal(central(f, afterRevoke.id), null); fresh.close();
+  const nextGrant = toolValue(await tool(admin, GRANT)).delegation.grantId; assert.notEqual(nextGrant, grantId);
+  at += 60001; await d.tick(); assert.equal(central(f, afterRevoke.id).state, 'sent');
+  admin.stopWatch(coordinator); const stopped = job(f, 'stopped'); await d.tick();
+  assert.equal(d.delegationSummary(coordinator).state, 'inactive_permit'); assert.equal(central(f, stopped.id), null);
+  admin.startWatch(coordinator); await d.tick();
+  assert.equal(d.getStatus(coordinator).service.delegation.state, 'stale_epoch'); assert.equal(central(f, stopped.id), null);
+  toolValue(await tool(admin, GRANT)); at += 60001; await d.tick(); assert.equal(central(f, stopped.id).state, 'sent');
+  assert.ok(Object.values(d.routes()).filter(r => r.status !== 'active').every(r => r.status === 'held' || r.status === 'closed'));
+  assert.ok(deliveries(f).every(item => item.params.arguments.prompt.includes('project: demo')));
+});
+
+test('revocation after lease, scan, read, claim, intent or bridge-connect awaits stops new effects; submitted sends retain receipts', async t => {
+  for (const stage of ['lease', 'scan', 'read', 'claim', 'intent', 'connect', 'send']) {
+    const f = fixture(t); await permitAndGrant(f); const item = job(f, `during-${stage}`); const next = job(f, `next-${stage}`);
+    const d = delegated(f); const revoke = () => d.delegation.revoke(coordinator, 'turn_metadata'); let triggered = false;
+    if (stage === 'lease') {
+      const original = d.driver.acquireLeader.bind(d.driver); d.driver.acquireLeader = async () => { const lease = await original(); revoke(); triggered = true; return lease; };
+    } else if (stage === 'scan' || stage === 'claim') {
+      const original = d.driver.run.bind(d.driver); d.driver.run = async (op, args) => { const result = await original(op, args); if (op === stage) { revoke(); triggered = true; } return result; };
+    } else if (stage === 'read') {
+      const original = d.client.readThread.bind(d.client); d.client.readThread = async (...args) => { const result = await original(...args); revoke(); triggered = true; return result; };
+    } else if (stage === 'intent') {
+      const original = d.client.send.bind(d.client); d.client.send = (...args) => { revoke(); triggered = true; return original(...args); };
+    } else if (stage === 'connect') {
+      const original = d.client.connect.bind(d.client); d.client.connect = async () => { await original(); revoke(); triggered = true; };
+    } else {
+      write(f.control, { sendDelayMs: 100 });
+      const original = d.client.send.bind(d.client); d.client.send = async (...args) => {
+        const submitted = original(...args); await until(() => deliveries(f).length > 0);
+        revoke(); triggered = true; return submitted;
+      };
+    }
+    await d.tick(); assert.equal(triggered, true); assert.equal(d.leader, null);
+    if (stage === 'send') {
+      const submitted = [item, next].filter(x => deliverySends(f, x.id).length);
+      assert.equal(submitted.length, 1); assert.equal(central(f, submitted[0].id).state, 'sent');
+      assert.ok(readJson(d.localPath(submitted[0].id, 'receipt.json')));
+    } else {
+      assert.equal(deliveries(f).length, 0); assert.equal(faults(f).length, 0);
+      if (['claim', 'intent'].includes(stage)) {
+        assert.equal([item, next].filter(x => central(f, x.id)?.state === 'sending').length, 1, 'permanent claim retained');
+      } else assert.ok([item, next].every(x => !central(f, x.id) || central(f, x.id).state === 'pending'));
+    }
+    if (stage === 'read') assert.ok([item, next].every(x => !readJson(d.localPath(x.id, 'wait.json'))), 'no new outcome after read authority ended');
+  }
+});
+
+test('delegated recovery keeps unknown sending single-attempt, acknowledges exact prior receipt and emits each fault once', async t => {
+  const f = fixture(t); await permitAndGrant(f); const prior = job(f, 'unknown'); const receiptJob = job(f, 'receipt'); const normal = job(f, 'normal');
+  cli(f, ['scan']); cli(f, ['claim', prior.id]); cli(f, ['claim', receiptJob.id]);
+  const d = delegated(f);
+  write(d.localPath(receiptJob.id, 'intent.json'), { schemaVersion: 1, deliveryId: receiptJob.id, project: 'demo', ownerThreadId: owner });
+  write(d.localPath(receiptJob.id, 'receipt.json'), { isError: false, content: [{ type: 'text', text: JSON.stringify({ threadId: owner }) }] });
+  await d.tick(); await d.tick();
+  assert.equal(central(f, prior.id).state, 'sending'); assert.equal(readJson(d.localPath(prior.id, 'outcome.json')).status, 'manual_review_required');
+  assert.equal(central(f, receiptJob.id).state, 'sent'); assert.equal(central(f, normal.id).state, 'sent');
+  assert.equal(deliverySends(f, prior.id).length, 0); assert.equal(deliverySends(f, receiptJob.id).length, 0); assert.equal(deliverySends(f, normal.id).length, 1);
+  assert.equal(faults(f).length, 1); assert.equal(faults(f)[0].params.arguments.threadId, coordinator);
+  assert.ok(fs.existsSync(path.join(f.mailboxRoot, 'claims', `${prior.id}.lock`)));
+});
+
+test('two delegated stdio instances share one OS leader; its exit releases ownership for a delegated standby', async t => {
+  let a, b;
+  t.after(async () => { await stopService(a); await stopService(b); });
+  const f = fixture(t); await permitAndGrant(f); write(f.config, { ...JSON.parse(fs.readFileSync(f.config)), pollIntervalMs: 1000 });
+  const env = { ...f.env }; delete env.CODEX_THREAD_ID;
+  a = service(f, path.join(root, 'plugin', 'server.mjs'), env);
+  b = service(f, path.join(root, 'plugin', 'server.mjs'), { ...env, CODEX_APP_TOOLS_PIPE_PATH: 'other-test-pipe' });
+  await Promise.all([a.call('initialize'), b.call('initialize')]);
+  const first = job(f, 'two-first'); await until(() => central(f, first.id)?.state === 'sent');
+  const second = job(f, 'two-second'); await until(() => central(f, second.id)?.state === 'sent');
+  const intent = id => readJson(path.join(f.stateDir, 'app-mailbox', 'deliveries', key(id), 'intent.json'));
+  assert.equal(intent(first.id).instanceId, intent(second.id).instanceId);
+  for (const item of [first, second]) assert.equal(deliverySends(f, item.id).length, 1);
+  assert.equal(a.toolCalls() + b.toolCalls(), 0); await stopService(a); await stopService(b);
+  let at = Date.now(); const x = delegated(f, { now: () => at }); const y = delegated(f, { now: () => at });
+  await x.tick(); await y.tick(); assert.deepEqual([x.runtimeState, y.runtimeState].sort(), ['leader', 'standby']);
+  const [lead, standby] = x.leader?.alive ? [x, y] : [y, x]; lead.close(); await pause(50);
+  at += 60001; const third = job(f, 'takeover'); await standby.tick();
+  assert.equal(central(f, third.id).state, 'sent'); assert.equal(deliverySends(f, third.id).length, 1);
+  assert.equal(readJson(standby.leaderPath()).instanceId, standby.instanceId);
 });

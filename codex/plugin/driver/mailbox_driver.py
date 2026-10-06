@@ -11,12 +11,17 @@ def main():
         raise ValueError("Python 3.10+ is required")
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
-    parser.add_argument("--lease", action="store_true")
+    leases = parser.add_mutually_exclusive_group()
+    leases.add_argument("--lease", action="store_true")
+    leases.add_argument("--authorization-lease", action="store_true")
     args = parser.parse_args()
     root = Path(args.root).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    if args.lease:
-        with (root / ".codex-mail-wake.leader.lock").open("a+b") as lock:
+    if args.lease or args.authorization_lease:
+        # Short grant/revoke controls serialize across MCP instances, separately
+        # from the long receiver leader. OS releases both locks on process exit.
+        name = ".codex-mail-wake.authorization.lock" if args.authorization_lease else ".codex-mail-wake.leader.lock"
+        with (root / name).open("a+b") as lock:
             try:
                 ledger.acquire(lock)
             except OSError:

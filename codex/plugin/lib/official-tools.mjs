@@ -115,7 +115,7 @@ export class OfficialTools {
     });
     this.ready = (async () => {
       await this.request('initialize', { protocolVersion: '2024-11-05', capabilities: {},
-        clientInfo: { name: 'codex-mail-wake', version: '0.3.2' } });
+        clientInfo: { name: 'codex-mail-wake', version: '0.4.0' } });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
       const catalog = await this.request('tools/list', {});
       for (const name of ['read_thread', 'send_message_to_thread']) {
@@ -144,25 +144,28 @@ export class OfficialTools {
       });
     });
   }
-  async call(name, args, ownerThreadId) {
+  async call(name, args, ownerThreadId, authorized = null) {
     await this.connect();
+    // connect/handshake may yield while another instance revokes authority.
+    // A request already submitted is never cancelled or automatically resent.
+    if (authorized && !authorized()) throw new Error('Receiver authorization ended before official request submission.');
     const result = await this.request('tools/call', { name, arguments: args,
       _meta: { 'x-codex-turn-metadata': { thread_id: ownerThreadId } } });
     // Retain native success/refusal and exact target fields, without saving pipe
     // strings that may appear in diagnostic text. Never use a new/guessed pipe.
     return this.safeResult(result);
   }
-  async readThread(ownerThreadId, callerThreadId = ownerThreadId) {
+  async readThread(ownerThreadId, callerThreadId = ownerThreadId, authorized = null) {
     const result = await this.call('read_thread', { threadId: ownerThreadId, turnLimit: 1,
-      includeOutputs: false, maxOutputCharsPerItem: 0 }, callerThreadId);
+      includeOutputs: false, maxOutputCharsPerItem: 0 }, callerThreadId, authorized);
     if (result.isError) throw new Error('Official read_thread rejected the read; native refusal retained.');
     const decoded = decodeText(result);
     if (decoded?.thread?.id !== ownerThreadId) throw new Error('Official read_thread returned a different owner identity.');
     return decoded;
   }
-  send(ownerThreadId, prompt, callerThreadId = ownerThreadId) {
+  send(ownerThreadId, prompt, callerThreadId = ownerThreadId, authorized = null) {
     // Deliberately no model, thinking, effort, service tier, host or turn override.
-    return this.call('send_message_to_thread', { threadId: ownerThreadId, prompt }, callerThreadId);
+    return this.call('send_message_to_thread', { threadId: ownerThreadId, prompt }, callerThreadId, authorized);
   }
   close() {
     const child = this.child;

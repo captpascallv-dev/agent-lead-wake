@@ -23,6 +23,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       : path.join(process.env.TEST_STATE, 'app-mailbox', 'faults', fault, 'intent.json');
     if (!fs.existsSync(intentPath)) throw new Error('Send happened before durable intent publication');
     if (control.sendMode === 'timeout') return;
+    if (control.sendDelayMs) return setTimeout(() => respond(request.id, { isError: false, content: [{ type: 'text', text: JSON.stringify({ threadId: params.arguments.threadId }) }] }), control.sendDelayMs);
     return respond(request.id, { isError: control.sendMode === 'reject', content: [{ type: 'text', text: JSON.stringify({ threadId: params.arguments.threadId }) }] });
   }
 });
